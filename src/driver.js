@@ -132,9 +132,9 @@ export async function status() {
   };
 }
 
+// 注意：绝对不要发 mouseMoved。编辑器页面上一次 mouseMoved 会阻塞约 5 秒
+// （窗口被遮挡时等不到帧确认），而我们只按坐标点击、不依赖 hover 状态。
 async function click(cdp, x, y, doubleClick = false) {
-  await cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
-  await sleep(80);
   const counts = doubleClick ? [1, 2] : [1];
   for (const cc of counts) {
     await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: cc });
@@ -182,14 +182,15 @@ async function selectNode(cdp, id) {
   await sleep(250);
 }
 
-async function typeIntoEditor(cdp, text) {  const has = await cdp.eval('!!window.__ZX.editorBox()');
+async function typeIntoEditor(cdp, text, fast = false) {
+  const has = await cdp.eval('!!window.__ZX.editorBox()');
   if (!has) throw new Error('没有进入文本编辑状态');
   await keyPress(cdp, 'a', 'KeyA', 65, 2); // Ctrl+A
-  await sleep(120);
+  await sleep(fast ? 50 : 120);
   await cdp.send('Input.insertText', { text });
-  await sleep(250);
+  await sleep(fast ? 110 : 250);
   await keyPress(cdp, 'Escape', 'Escape', 27);
-  await sleep(600);
+  await sleep(fast ? 270 : 600);
 }
 
 export async function readTree(titleHint) {
@@ -207,6 +208,48 @@ async function resolveId(cdp, { nodeId, text }) {
   if (!r.hits.length) throw new Error(`没有文字为「${text}」的节点。可以先调用 zhixi_read_tree 看看有哪些节点。`);
   if (r.hits.length > 1) throw new Error(`「${text}」匹配到 ${r.hits.length} 个节点，请改用 nodeId：` + r.hits.map((h) => `${h.id}(${h.text})`).join(', '));
   return r.hits[0].id;
+}
+
+// 批量新增同级子节点：第一个用「子主题」，其余用「主题」（同级），省掉反复选中父节点的开销
+export async function addNodes({ parentId, parentText, texts }, titleHint) {
+  const list = (Array.isArray(texts) ? texts : []).map((t) => String(t == null ? '' : t).trim()).filter((t) => t);
+  if (!list.length) throw new Error('texts 需要是非空的文字数组');
+  if (list.length > 60) throw new Error('一次不要超过 60 个节点，分批调用更稳');
+  return withEditor(titleHint, async (cdp) => {
+    const pid = await resolveId(cdp, { nodeId: parentId, text: parentText });
+    await selectNode(cdp, pid);
+    const t0 = Date.now();
+    const timings = [];
+    for (let i = 0; i < list.length; i++) {
+      const ti = Date.now();
+      const label = i === 0 ? '子主题' : '主题';
+      const btn = await cdp.eval(`window.__ZX.toolbarBtn(${JSON.stringify(label)})`);
+      const tQuery = Date.now() - ti;
+      if (!btn) throw new Error(`工具栏没找到「${label}」按钮`);
+      await click(cdp, btn.x, btn.y);
+      const tClick = Date.now() - ti;
+      await sleep(600);
+      await typeIntoEditor(cdp, list[i], true);
+      timings.push({ i, query: tQuery, clickDone: tClick, total: Date.now() - ti });
+      if (timings.length > 6) timings.shift();
+      if (process.env.ZHIXI_DEBUG) console.error('[timing]', JSON.stringify(timings[timings.length - 1]));
+    }
+    const nodes = await cdp.eval('window.__ZX.nodes()');
+    const kids = nodes.filter((n) => n.parentId === pid).map((n) => ({ id: n.id, text: n.text }));
+    const sync = await waitSaved(cdp);
+    const ms = Date.now() - t0;
+    return {
+      ok: true,
+      parentId: pid,
+      added: list.length,
+      ms,
+      perNodeMs: Math.round(ms / list.length),
+      children: kids,
+      total: nodes.length,
+      synced: sync.saved,
+      timings,
+    };
+  });
 }
 
 export async function addNode({ parentId, parentText, text }, titleHint) {

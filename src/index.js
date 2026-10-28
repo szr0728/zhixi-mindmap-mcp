@@ -2,7 +2,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import {
-  status, listMaps, openMap, readTree, addNode, updateNode, deleteNode, moveNode, screenshot, cloudCheck,
+  status, listMaps, openMap, readTree, addNode, addNodes, updateNode, deleteNode, moveNode, screenshot, cloudCheck,
   createFolder, createMap, renameItem, moveItems, deleteItem, searchMaps,
 } from './driver.js';
 
@@ -87,6 +87,22 @@ server.registerTool(
     },
   },
   wrap(async (a) => text(await addNode(a, hint(a)))),
+);
+
+server.registerTool(
+  'zhixi_add_nodes',
+  {
+    title: '批量新增子节点',
+    description: '一次性在同一个父节点下批量添加多个子节点，比连续调用 zhixi_add_node 快 3 倍左右。texts 是文字数组。',
+    inputSchema: {
+      parentId: z.string().optional().describe('父节点 id'),
+      parentText: z.string().optional().describe('父节点文字（全图唯一）'),
+      texts: z.array(z.string()).describe('要添加的子节点文字列表'),
+      mapId: z.string().optional().describe(`导图 id（同时打开多张时必传）`),
+      mapTitle: z.string().optional().describe(`导图标题关键字`),
+    },
+  },
+  wrap(async (a) => text(await addNodes(a, hint(a)))),
 );
 
 server.registerTool(

@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "zhixi": {
+      "command": "node",
+      "args": ["/ABSOLUTE/PATH/TO/zhixi-mcp/src/index.js"],
+      "env": {
+        "ZHIXI_CDP_PORT": "19222"
+      }
+    }
+  }
+}

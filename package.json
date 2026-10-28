@@ -1,0 +1,31 @@
+{
+  "name": "zhixi-mindmap-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP server for the Zhixi mind-map desktop client — node-level create/update/delete/move via Chrome DevTools Protocol, with live canvas updates.",
+  "main": "src/index.js",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "mindmap",
+    "zhixi",
+    "electron",
+    "cdp",
+    "chrome-devtools-protocol"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/szr0728/zhixi-mindmap-mcp.git"
+  },
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2"
+  }
+}

@@ -42,7 +42,7 @@ const main = async () => {
     const r = await call('zhixi_read_tree');
     console.log(r.text?.slice(0, 1500));
   }
-  if (cmd === 'maps') console.log(JSON.stringify(await call('zhixi_list_maps'), null, 1).slice(0, 800));
+  if (cmd === 'maps') console.log(JSON.stringify(await call('zhixi_list_maps', JSON.parse(process.argv[3] || '{}')), null, 1).slice(0, 1500));
   if (cmd === 'add') console.log(JSON.stringify(await call('zhixi_add_node', JSON.parse(process.argv[3])), null, 1).slice(0, 800));
   if (cmd === 'upd') console.log(JSON.stringify(await call('zhixi_update_node', JSON.parse(process.argv[3])), null, 1).slice(0, 800));
   if (cmd === 'del') console.log(JSON.stringify(await call('zhixi_delete_node', JSON.parse(process.argv[3])), null, 1).slice(0, 800));

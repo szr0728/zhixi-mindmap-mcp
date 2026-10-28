@@ -37,21 +37,28 @@ server.registerTool(
 server.registerTool(
   'zhixi_list_maps',
   {
-    title: '列出我的导图',
-    description: '读取知犀客户端首页显示的导图标题列表（我的云文档 / 最近），用于挑选要操作的目标。',
-    inputSchema: {},
+    title: '列出我的导图（含文件夹）',
+    description: '读取云端真实的文件夹树，返回每个导图的完整路径（如「考公/申论/万能思维体系」）和 fileId。可用 folder 参数只看某个文件夹。',
+    inputSchema: {
+      folder: z.string().optional().describe('只看这个文件夹（写文件夹名或完整路径，如「考公」或「考公/申论」）'),
+      includeFiles: z.boolean().optional().describe('是否列出导图文件，默认 true；只要文件夹树时传 false'),
+    },
   },
-  wrap(async () => text(await listMaps())),
+  wrap(async (a) => text(await listMaps(a))),
 );
 
 server.registerTool(
   'zhixi_open_map',
   {
     title: '打开导图',
-    description: '在知犀客户端里按标题打开一张导图（会在用户屏幕上真实打开窗口）。写操作前需要先打开目标导图。',
-    inputSchema: { title: z.string().describe('导图标题，需与首页显示一致') },
+    description: '在知犀客户端里打开导图（会在用户屏幕上真实打开窗口）。三种定位方式任选一种：path（完整路径，最准）、fileId（来自 zhixi_list_maps）、title（标题，必须全库唯一）。',
+    inputSchema: {
+      path: z.string().optional().describe('完整路径，如「考公/申论/万能思维体系」'),
+      fileId: z.string().optional().describe('导图 id，来自 zhixi_list_maps 的 files[].fileId'),
+      title: z.string().optional().describe('导图标题；同名多于一个时会报错并列出候选路径'),
+    },
   },
-  wrap(async ({ title }) => text(await openMap({ title }))),
+  wrap(async (a) => text(await openMap(a))),
 );
 
 server.registerTool(

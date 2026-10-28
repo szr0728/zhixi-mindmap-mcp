@@ -74,7 +74,7 @@ async function attachEditor(titleHint) {
   if (!editors.length) throw new Error('当前没有打开的导图。请先用 zhixi_open_map 打开一张，或在客户端里手动打开。');
   let t = editors[0];
   if (titleHint) {
-    const hit = editors.find((e) => (e.title || '').includes(titleHint));
+    const hit = editors.find((e) => (e.title || '').includes(titleHint) || (e.url || '').includes(titleHint));
     if (hit) t = hit;
   }
   const cdp = await Cdp.connect(t.webSocketDebuggerUrl);
@@ -278,23 +278,106 @@ async function attachHome() {
   return cdp;
 }
 
-export async function listMaps() {
+// 通过主进程 IPC 拉取完整云文档树（含文件夹层级）
+async function fetchTree(cdp) {
+  const raw = await cdp.eval(`(async () => {
+    try {
+      return await window.__runtime.invoke('fs:query-file-tree', { recursive: true, includeFiles: true });
+    } catch (e) { return { code: -1, message: String(e && e.message || e) }; }
+  })()`);
+  if (!raw || raw.code !== 0) {
+    throw new Error('获取云文档目录失败：' + JSON.stringify(raw).slice(0, 160));
+  }
+  return raw.data || [];
+}
+
+// 把嵌套树拍平成带完整路径的列表；type 0 = 文件夹，1 = 导图文件
+function flattenTree(nodes, parentPath = '') {
+  const out = [];
+  for (const n of nodes) {
+    const isFolder = n.type === 0;
+    const title = (n.title || '').trim() || '(未命名)';
+    const path = parentPath ? `${parentPath}/${title}` : title;
+    out.push({
+      path,
+      title,
+      isFolder,
+      fileId: n.fileId || null,
+      id: n.id,
+      updatedAt: n.updatedAt || null,
+    });
+    if (isFolder && Array.isArray(n.children) && n.children.length) {
+      out.push(...flattenTree(n.children, path));
+    }
+  }
+  return out;
+}
+
+function treeText(items) {
+  return items
+    .map((it) => '  '.repeat(it.path.split('/').length - 1) + (it.isFolder ? '📁 ' : '📄 ') + it.title)
+    .join('\n');
+}
+
+export async function listMaps({ folder, includeFiles = true } = {}) {
   const cdp = await attachHome();
   try {
-    const r = await cdp.eval(`(() => {
-      const titles = new Set();
-      document.querySelectorAll('[class*=card_title]').forEach((el) => {
-        const t = (el.textContent || '').trim();
-        if (t && t.length < 60) titles.add(t.replace(/(.+?)\\1$/, '$1'));
-      });
-      document.querySelectorAll('tr').forEach((tr) => {
-        const c = tr.querySelector('td,div');
-        if (c) { const t = (c.textContent || '').trim(); if (t && t.length < 60) titles.add(t); }
-      });
-      return [...titles].filter((t) => t);
-    })()`);
-    return { count: r.length, titles: r };
+    const all = flattenTree(await fetchTree(cdp));
+    let scoped = all;
+    let scopePath = null;
+    if (folder && String(folder).trim()) {
+      const q = String(folder).trim().replace(/^\/+|\/+$/g, '');
+      const norm = (s) => s.replace(/\s+/g, '').toLowerCase();
+      const hit = all.find((it) => it.isFolder && (norm(it.path) === norm(q) || norm(it.title) === norm(q)));
+      if (!hit) {
+        const guess = all.filter((it) => it.isFolder && norm(it.path).includes(norm(q))).map((it) => it.path);
+        throw new Error(`没有找到文件夹「${folder}」。` + (guess.length ? `相近的有：${guess.slice(0, 8).join('、')}` : '可以先不带 folder 参数看全部分录。'));
+      }
+      scopePath = hit.path;
+      scoped = all.filter((it) => it.path === hit.path || it.path.startsWith(hit.path + '/'));
+    }
+
+    const folders = scoped.filter((it) => it.isFolder);
+    const files = scoped.filter((it) => !it.isFolder);
+
+    const result = {
+      scope: scopePath || '全部',
+      folderCount: folders.length,
+      fileCount: files.length,
+      folders: folders.map((f) => f.path),
+    };
+    if (includeFiles) {
+      result.files = files.map((f) => ({ path: f.path, title: f.title, fileId: f.fileId }));
+    }
+    result.tree = treeText(scoped);
+    return result;
   } finally { cdp.close(); }
+}
+
+// 用主进程自己打开的接口按 fileId 打开导图（比点 DOM 稳）
+async function openByFileId(cdp, node) {
+  const arg = {
+    iscloud: true,
+    fileid: node.fileId,
+    title: node.title,
+    params: {},
+    focus: true,
+    opentab: true,
+    filepath: null,
+  };
+  const r = await cdp.eval(`(async () => {
+    try { return { ok: true, r: await window.__runtime.invoke('wm:r-open-file', ${JSON.stringify(arg)}) }; }
+    catch (e) { return { ok: false, err: String(e && e.message || e) }; }
+  })()`);
+  if (!r.ok) return { target: null, err: r.err };
+
+  for (let i = 0; i < 24; i++) {
+    await sleep(500);
+    const targets = await listTargets();
+    const hit = targets.find((t) => (t.url || '').includes('editor.html') && (t.url || '').includes(node.fileId));
+    if (hit) return { target: hit };
+  }
+  return { target: null, err: '调用成功但编辑器窗口迟迟没出现' };
 }
 
 const findTitleInHome = `(() => {
@@ -311,28 +394,84 @@ const findTitleInHome = `(() => {
   return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) };
 })()`;
 
-export async function openMap({ title }) {
-  let pos = null;
-  for (let attempt = 0; attempt < 3 && !pos; attempt++) {
+// 兜底：在首页点卡片打开
+async function openByClick(title) {
+  for (let attempt = 0; attempt < 2; attempt++) {
     const cdp = await attachHome();
     try {
-      pos = await cdp.eval(`(() => { window.__ZX_TITLE = ${JSON.stringify(title)}; return ${findTitleInHome}; })()`);
-      if (!pos) {
-        await sleep(1500);
-        pos = await cdp.eval(`(() => { window.__ZX_TITLE = ${JSON.stringify(title)}; return ${findTitleInHome}; })()`);
-      }
+      const pos = await cdp.eval(`(() => { window.__ZX_TITLE = ${JSON.stringify(title)}; return ${findTitleInHome}; })()`);
       if (pos) {
         await click(cdp, pos.x, pos.y);
         await sleep(150);
         await click(cdp, pos.x, pos.y);
         await sleep(4500);
+        return true;
       }
     } finally { cdp.close(); }
   }
-  if (!pos) throw new Error(`首页没找到标题为「${title}」的导图。可以先调用 zhixi_list_maps。`);
+  return false;
+}
 
-  const targets = await listTargets();
-  const editors = targets.filter((t) => (t.url || '').includes('editor.html'));
-  const hit = editors.find((e) => (e.title || '').includes(title)) || editors[editors.length - 1];
-  return { ok: true, title: hit ? hit.title : title, id: hit ? (hit.url.split('id=')[1] || '') : null };
+export async function openMap({ title, path, fileId } = {}) {
+  const cdp = await attachHome();
+  let node = null;
+  try {
+    const all = flattenTree(await fetchTree(cdp));
+    const files = all.filter((it) => !it.isFolder);
+    const norm = (s) => (s || '').replace(/\s+/g, '').toLowerCase();
+
+    if (fileId) {
+      node = files.find((f) => f.fileId === fileId) || { fileId, title: title || '' };
+    } else if (path) {
+      const q = String(path).replace(/^\/+|\/+$/g, '');
+      const hit = files.filter((f) => norm(f.path) === norm(q));
+      if (hit.length === 1) node = hit[0];
+      else if (hit.length > 1) throw new Error(`路径「${path}」匹配到 ${hit.length} 个文件，请用 fileId：` + hit.map((h) => h.fileId).join(', '));
+      else {
+        const guess = files.filter((f) => norm(f.path).includes(norm(q))).map((f) => f.path);
+        throw new Error(`没有找到路径为「${path}」的导图。` + (guess.length ? `相近的有：${guess.slice(0, 6).join('、')}` : ''));
+      }
+    } else if (title) {
+      const hit = files.filter((f) => norm(f.title) === norm(title));
+      if (hit.length === 1) node = hit[0];
+      else if (hit.length > 1) {
+        throw new Error(`有 ${hit.length} 张导图都叫「${title}」，请改用 path 或 fileId 指定：` + hit.map((h) => `${h.path}(${h.fileId})`).join('、'));
+      } else {
+        const guess = files.filter((f) => norm(f.title).includes(norm(title))).map((f) => f.path);
+        throw new Error(`没有标题为「${title}」的导图。` + (guess.length ? `相近的有：${guess.slice(0, 6).join('、')}` : '可以先调用 zhixi_list_maps。'));
+      }
+    } else {
+      throw new Error('需要提供 title、path 或 fileId 之一');
+    }
+
+    if (!node.fileId) throw new Error('解析不到该导图的 fileId');
+
+    const opened = await openByFileId(cdp, node);
+    if (opened.target) {
+      const t = opened.target.title || '';
+      return {
+        ok: true,
+        title: t && !/^editor\.html/.test(t) ? t : node.title,
+        fileId: node.fileId,
+        path: node.path || null,
+        via: 'ipc',
+      };
+    }
+
+    // 兜底走 UI 点击
+    const clicked = await openByClick(node.title);
+    if (!clicked) throw new Error(`按 fileId 打开失败（${opened.err || '未知'}），首页点击也找不到「${node.title}」`);
+    const targets = await listTargets();
+    const ed = targets.filter((t) => (t.url || '').includes('editor.html'));
+    const hit = ed.find((e) => (e.title || '').includes(node.title)) || ed[ed.length - 1];
+    return {
+      ok: true,
+      title: hit ? hit.title : node.title,
+      fileId: hit ? (hit.url.split('id=')[1] || null) : node.fileId,
+      path: node.path || null,
+      via: 'click',
+    };
+  } finally {
+    cdp.close();
+  }
 }

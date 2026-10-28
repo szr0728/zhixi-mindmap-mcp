@@ -81,8 +81,8 @@ const fk = rootEl && Object.keys(rootEl).find(k => k.startsWith('__react'));
 | 工具 | 说明 |
 |---|---|
 | `zhixi_status` | 连通性 + 当前打开了哪些导图 |
-| `zhixi_list_maps` | 列出首页可见的导图标题（读 DOM，只覆盖当前视图） |
-| `zhixi_open_map` | 按标题双击打开导图 |
+| `zhixi_list_maps` | 云端完整文件夹树（19 个文件夹 / 37 个文件的实测规模），返回每个导图的路径 + fileId；可用 `folder` 只看某个目录 |
+| `zhixi_open_map` | 按 `path` / `fileId` / `title` 打开导图，走主进程 IPC，不依赖首页 DOM |
 | `zhixi_read_tree` | 导出全部节点（id / 文字 / 层级 / 父节点） |
 | `zhixi_add_node` | 在指定节点下新增子节点并写文字 |
 | `zhixi_update_node` | 改节点文字 |
@@ -92,10 +92,28 @@ const fk = rootEl && Object.keys(rootEl).find(k => k.startsWith('__react'));
 
 写操作建议用 `nodeId`。用文字定位时必须全图唯一，否则报错并列出候选 id——不做模糊匹配，避免删错。
 
+## 云文档目录：怎么拿到文件夹层级
+
+首页 DOM 只能看到"当前这一屏"，拿不到目录树。真正的数据在**主进程**里，渲染进程通过 IPC 取。
+
+给客户端加 `--inspect=9229` 后可以连上主进程的 Node inspector，`ipcMain._invokeHandlers` 里有 132 个通道。其中三个是关键：
+
+| 通道 | 参数 | 作用 |
+|---|---|---|
+| `fs:query-file-tree` | `{recursive: true, includeFiles: true}`（**不要传 `pid: ''`**，传了会返回空） | 返回整棵目录树，`type: 0` 是文件夹、`type: 1` 是导图，节点形如 `{id, type, title, fileId, parentId, children[]}` |
+| `fs:query-file-list` | `{pid, page, title, orderBy, limit}` | 分页列表 |
+| `wm:r-open-file` | `{iscloud: true, fileid, title, params: {}, focus: true, opentab: true}`（注意是**小写 `fileid`**） | 按 fileId 直接开标签页，比点 DOM 稳得多 |
+
+> 这些通道可以从渲染进程用 `window.__runtime.invoke(通道名, 参数)` 直接调，不需要连主进程。`--inspect` 只是当时用来"看有哪些通道、参数是什么"的。
+
+渲染进程**没有** `require` / `process`（contextIsolation 开着），只能通过 preload 暴露的 `window.__runtime`（`invoke / send / sendMessage / on`）。之前失败过的 `m-files-list` 是应用内部的别名，真正注册在主进程里的是 `fs:*` 这一套。
+
 ## 已知限制
 
 - 只支持 Windows（`tasklist` 检测进程、默认安装路径都是 Windows 的）。
 - 客户端必须处于登录态且能连上知犀服务器。
+- `zhixi_list_maps` 只列**云端**导图，本地文件（`.zxmind`）不在里面。
+- 同一文件夹里允许存在同名导图，这时 `open_map` 用 `path` 会报"匹配到多个"，要改用 `fileId`。
 - 节点必须在可视区域内（脚本会尝试居中，折叠分支需先展开）。
 - **慢**：每次写操作模拟真人交互，单次 1–3 秒。批量改几十个节点会很难等，要快就得上直连注入，但那会牺牲同步可靠性。
 - 客户端是 MCP 进程的子进程，MCP 退出时可能被系统回收；下次调用会自动重启，但之前打开的导图窗口不在了，要重新 `open_map`。

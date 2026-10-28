@@ -62,19 +62,51 @@ const fk = rootEl && Object.keys(rootEl).find(k => k.startsWith('__react'));
 
 | 操作 | 实际动作 |
 |---|---|
-| 新增子节点 | 点击父节点 → 点工具栏「子主题」→ Ctrl+A → `Input.insertText` → Esc |
-| 改文字 | 双击节点 → Ctrl+A → `Input.insertText` → Esc |
+| 新增子节点 | 点击父节点 → 点工具栏「子主题」→ 用 Quill `setContents` 写入 → Esc |
+| 改文字 | 双击节点 → Quill `setContents` 写入 → Esc |
 | 删除 | 点击节点 → Delete |
 | 移动 | Ctrl+X → 点击新父节点 → Ctrl+V |
 
 节点与 DOM 的映射是 `g.zx-node[data-node-id="<uid>"]`，能精确拿到每个节点的 bbox 去点，不靠坐标猜位置。
 
-**试过但放弃的两条路：**
+**点击前必须用 `elementFromPoint` 校验**（`ensureClickable`）。只看坐标范围会出事：节点有一半在视口外时，中心点仍在界内，但 `getBoundingClientRect` 给的是未裁剪的坐标，点下去会落到旁边的节点上——实测就撞到过「想选分支主题1、实际选中了中心主题」。现在先问浏览器「这个点上是谁」，不是目标节点就先 `moveNodeToViewCenter`，还不行直接报错中止，绝不带病继续。
+
+**试过但放弃的三条路：**
 
 1. `store.updateNodeData()` —— 真实签名是 `(id, key, value)` 而不是 `(id, dataObject)`，传对象会把 key 写成 `"[object Object]"`，污染数据。
 2. 直写 Yjs doc（`store.share.get('nodes').get(uid).set('data', ...)`）—— 模型确实变了，但视图不刷新；而且随后会被云端版本覆盖回来。
+3. 模拟键入 `$...$` 让编辑器自动转公式 —— 知犀没有这个监听，`$...$` 只会原样当文字存下来。
 
 根因：数据层是 Yjs CRDT，`store` 里的节点 `data` 只是本地缓存，权威副本在文档里，而视图刷新挂在应用自己的 effect 队列上。只有走应用真实的编辑链路，才能同时满足「写入文档」和「立即重绘」。
+
+## 数学公式：Quill Delta + source='user'
+
+节点的富文本藏在 `data.richText`，是标准 Quill Delta：
+
+```json
+{
+  "text": "圆的方程：\n",
+  "richText": { "ops": [
+    { "insert": "圆的方程：" },
+    { "insert": { "formula": "x^2+y^2=r^2" } },
+    { "insert": "\n" }
+  ] }
+}
+```
+
+注意 `data.text` 是**丢掉公式后的纯文本**，所以只读 `text` 会把公式全丢了。读取时由 `deltaText()` 把 `formula` 还原成 `$latex$`，读写才能对齐。
+
+写入的关键只有一条：**调 Quill API 必须传 `source='user'`**。
+
+```js
+const q = document.querySelector('.ql-container').__quill;  // 实例挂在容器上
+q.setContents(delta, 'user');                                // 不传就白写
+q.insertEmbed(idx, 'formula', latex, 'user');
+```
+
+默认的 `source='api'` 会被编辑器的 text-change 监听忽略，改动看着进了编辑器，Esc 一提交就没了——排查时极易误判成"编辑器不接收程序化输入"。实际是 source 的问题。
+
+知犀注册的公式 blot 就是 Quill 标准的那套：`blotName="formula"`、`className="ql-formula"`、`tagName="SPAN"`，渲染靠 KaTeX（页面里 `katex` 全局对象和 `katex.min.css` 都加载好了）。
 
 ## 工具
 

@@ -3,7 +3,7 @@ import { Cdp, listTargets, sleep, ensureClient } from './cdp.js';
 
 // 页面侧辅助脚本（幂等注入）
 const PAGE_HELPERS = `(() => {
-  if (window.__ZX && window.__ZX.__v === 2) return true;
+  if (window.__ZX && window.__ZX.__v === 3) return true;
   const protoFns = (o) => { const out = []; let p = o; while (p && p !== Object.prototype) { for (const k of Object.getOwnPropertyNames(p)) { if (k === 'constructor') continue; try { if (typeof o[k] === 'function') out.push(k); } catch (e) {} } p = Object.getPrototypeOf(p); } return [...new Set(out)]; };
   const findMM = () => {
     if (window.__ZX_MM && window.__ZX_MM.store) return window.__ZX_MM;
@@ -23,8 +23,19 @@ const PAGE_HELPERS = `(() => {
     }
     return null;
   };
+  // 把节点的富文本还原成带 $...$ 的文本，公式才能读得回来
+  const deltaText = (d) => {
+    const rt = d && d.richText;
+    if (!rt || !Array.isArray(rt.ops)) return String((d && d.text) || '');
+    let s = '';
+    rt.ops.forEach((op) => {
+      if (typeof op.insert === 'string') s += op.insert;
+      else if (op.insert && op.insert.formula) s += '$' + op.insert.formula + '$';
+    });
+    return s;
+  };
   const flat = (node, depth, out, parentId) => {
-    const text = ((node.data && node.data.text) || '').replace(/\\n/g, '').trim();
+    const text = deltaText(node.data).replace(/\\n/g, '').trim();
     out.push({ id: node.id, text, depth, parentId: parentId || null });
     const kids = (node.children && node.children.normal) || [];
     kids.forEach((c) => flat(c, depth + 1, out, node.id));
@@ -36,11 +47,14 @@ const PAGE_HELPERS = `(() => {
     const d = node.data || {};
     const item = {
       id: node.id,
-      text: String(d.text || '').replace(/\\n/g, '').trim(),
+      text: deltaText(d).replace(/\\n/g, '').trim(),
       depth,
       parentId: parentId || null,
     };
     if (kind && kind !== 'normal') item.kind = kind;
+    if (d.richText && Array.isArray(d.richText.ops) && d.richText.ops.some((o) => o.insert && o.insert.formula)) {
+      item.hasFormula = true;
+    }
     if (d.note) item.note = String(d.note).replace(/<[^>]+>/g, ' ').replace(/\\s+/g, ' ').trim().slice(0, 300);
     if (d.todo) item.todo = d.todo;
     if (d.expandState === 'collapse') item.collapsed = true;
@@ -52,7 +66,7 @@ const PAGE_HELPERS = `(() => {
     return out;
   };
   window.__ZX = {
-    __v: 2,
+    __v: 3,
     mm: findMM,
     tree() { const mm = findMM(); if (!mm) return null; return mm.store.toJson(); },
     nodes() { const t = this.tree(); if (!t) return null; return flat(t.root, 0, [], null); },
@@ -192,25 +206,108 @@ async function waitSaved(cdp, timeout = 8000) {
   return { saved: false, ms: Date.now() - t0 };
 }
 
-async function selectNode(cdp, id) {
-  let rect = await cdp.eval(`window.__ZX.rect(${JSON.stringify(id)})`);
-  if (!rect) {
-    // 可能不在视口内，先定位到节点
-    await cdp.eval(`(() => { const mm = window.__ZX.mm(); try { mm.moveNodeToViewCenter ? mm.moveNodeToViewCenter(${JSON.stringify(id)}) : mm.renderer && mm.renderer.moveNodeToViewCenter && mm.renderer.moveNodeToViewCenter(${JSON.stringify(id)}); } catch(e){} return true; })()`);
-    await sleep(500);
-    rect = await cdp.eval(`window.__ZX.rect(${JSON.stringify(id)})`);
+// 保证节点坐标真的可点：用 elementFromPoint 直接确认那个点上是不是目标节点。
+// 只判断坐标范围不够 —— 节点可能一半在视口外（中心在界内但实际被裁剪），
+// 此时点击会打空甚至命中旁边的节点，导致改错。
+const PROBE_FN = (id) => `(() => {
+  const id = ${JSON.stringify(id)};
+  const r = window.__ZX.rect(id);
+  if (!r) return { rect: null, ok: false, why: 'no-rect' };
+  const el = document.elementFromPoint(r.x, r.y);
+  const owner = el && el.closest ? el.closest('g.zx-node') : null;
+  const hit = owner ? owner.getAttribute('data-node-id') : (el ? el.tagName : 'none');
+  return { rect: r, ok: hit === id, why: hit === id ? 'ok' : 'hit:' + hit };
+})()`;
+
+async function ensureClickable(cdp, id) {
+  let st = await cdp.eval(PROBE_FN(id));
+  if (st.ok) return st.rect;
+
+  // 不在可点位置：把节点移到视图中心再试
+  for (let attempt = 0; attempt < 2 && !st.ok; attempt++) {
+    await cdp.eval(`(() => {
+      const mm = window.__ZX.mm(); const id = ${JSON.stringify(id)};
+      try {
+        if (mm.renderer && mm.renderer.moveNodeToViewCenter) mm.renderer.moveNodeToViewCenter(id);
+        else if (mm.moveNodeToViewCenter) mm.moveNodeToViewCenter(id);
+        else return 'no-api';
+      } catch (e) { return 'err'; }
+      return 'ok';
+    })()`);
+    await sleep(800);
+    st = await cdp.eval(PROBE_FN(id));
   }
-  if (!rect) throw new Error('找不到该节点在画布上的位置（可能已折叠或在其他视图）: ' + id);
-  await click(cdp, rect.x, rect.y);
-  await sleep(250);
+  if (!st.ok) {
+    const where = st.rect ? `坐标 ${st.rect.x},${st.rect.y}` : '拿不到坐标';
+    throw new Error(`节点无法定位到可点击位置（${where}，${st.why}），为避免改错节点已中止。nodeId=${id}`);
+  }
+  return st.rect;
 }
 
+async function selectNode(cdp, id) {
+  const rect = await ensureClickable(cdp, id);
+  await click(cdp, rect.x, rect.y);
+  await sleep(250);
+
+  // 校验：点击后必须能在选中态里看到目标节点，否则宁可报错也不继续
+  const selIds = JSON.parse(await cdp.eval(
+    'JSON.stringify([...document.querySelectorAll("g.zx-node.selected")].map(g => g.getAttribute("data-node-id")))',
+  ) || '[]');
+  if (!selIds.includes(id)) {
+    throw new Error(`点击未能选中目标节点（实际选中: ${selIds.length ? selIds.join(',') : '无'}），为避免改错节点已中止。nodeId=${id}`);
+  }
+}
+
+// 把带 $...$ 的文本转成 Quill Delta。$...$ 里是 LaTeX，会被渲染成真正的数学公式。
+// 例：'圆方程：$x^2+y^2=r^2$' ->
+//    [{insert:'圆方程：'}, {insert:{formula:'x^2+y^2=r^2'}}, {insert:'\n'}]
+export function textToDelta(text) {
+  const s = String(text == null ? '' : text);
+  const ops = [];
+  const re = /\$([^$\n]+)\$/g;
+  let last = 0;
+  let m;
+  while ((m = re.exec(s))) {
+    if (m.index > last) ops.push({ insert: s.slice(last, m.index) });
+    ops.push({ insert: { formula: m[1] } });
+    last = m.index + m[0].length;
+  }
+  const tail = s.slice(last);
+  if (tail) ops.push({ insert: tail });
+
+  // 合并相邻的字符串 op
+  const merged = [];
+  for (const op of ops) {
+    const prev = merged[merged.length - 1];
+    if (prev && typeof prev.insert === 'string' && typeof op.insert === 'string') prev.insert += op.insert;
+    else merged.push(op);
+  }
+  if (!merged.length) merged.push({ insert: '' });
+  const lastOp = merged[merged.length - 1];
+  if (typeof lastOp.insert === 'string') {
+    if (!lastOp.insert.endsWith('\n')) lastOp.insert += '\n';
+  } else {
+    merged.push({ insert: '\n' });
+  }
+  return { ops: merged };
+}
+
+// 写入节点文本。必须走 Quill API 并传 source='user'：
+//   默认的 'api' source 会被编辑器忽略，改动不会落到节点上。
+// 用 setContents 而不是模拟键盘输入，才能把公式作为 embed 精确插进去。
 async function typeIntoEditor(cdp, text, fast = false) {
-  const has = await cdp.eval('!!window.__ZX.editorBox()');
-  if (!has) throw new Error('没有进入文本编辑状态');
-  await keyPress(cdp, 'a', 'KeyA', 65, 2); // Ctrl+A
-  await sleep(fast ? 50 : 120);
-  await cdp.send('Input.insertText', { text });
+  const ready = await cdp.eval(
+    '!!(document.querySelector(".ql-container") && document.querySelector(".ql-container").__quill)',
+  );
+  if (!ready) throw new Error('没有进入文本编辑状态');
+  const delta = JSON.stringify(textToDelta(text));
+  const raw = await cdp.eval(`(() => {
+    const q = document.querySelector('.ql-container').__quill;
+    try { q.setContents(${delta}, 'user'); return JSON.stringify({ ok: true, len: q.getLength() }); }
+    catch (e) { return JSON.stringify({ ok: false, err: String(e && e.message || e).slice(0, 160) }); }
+  })()`);
+  const res = JSON.parse(raw);
+  if (!res.ok) throw new Error('写入文本失败：' + res.err);
   await sleep(fast ? 110 : 250);
   await keyPress(cdp, 'Escape', 'Escape', 27);
   await sleep(fast ? 270 : 600);
@@ -225,6 +322,7 @@ export async function readTree(titleHint) {
       summary: nodes.filter((n) => n.kind === 'summary').length,
       boundary: nodes.filter((n) => n.kind === 'boundary').length,
       withNote: nodes.filter((n) => n.note).length,
+      withFormula: nodes.filter((n) => n.hasFormula).length,
       collapsed: nodes.filter((n) => n.collapsed).length,
     };
     return { mapTitle: title, id: (target.url.split('id=')[1] || ''), count: nodes.length, stats, nodes };
@@ -285,6 +383,7 @@ export async function addNodes({ parentId, parentText, texts }, titleHint) {
 export async function addNode({ parentId, parentText, text }, titleHint) {
   return withEditor(titleHint, async (cdp) => {
     const pid = await resolveId(cdp, { nodeId: parentId, text: parentText });
+    const beforeIds = new Set((await cdp.eval('window.__ZX.nodes()') || []).map((n) => n.id));
     await selectNode(cdp, pid);
     const btn = await cdp.eval(`window.__ZX.toolbarBtn('子主题')`);
     if (!btn) throw new Error('工具栏没找到「子主题」按钮');
@@ -292,7 +391,8 @@ export async function addNode({ parentId, parentText, text }, titleHint) {
     await sleep(800);
     await typeIntoEditor(cdp, text);
     const nodes = await cdp.eval('window.__ZX.nodes()');
-    const created = nodes.filter((n) => n.text === text.replace(/\n/g, '').trim() && n.parentId === pid);
+    // 按「新增的 id」判断，不用文字比对（公式会被还原成 $...$，比对容易失配）
+    const created = nodes.filter((n) => n.parentId === pid && !beforeIds.has(n.id));
     const sync = await waitSaved(cdp);
     return { ok: true, parentId: pid, created: created[0] || null, count: nodes.length, synced: sync.saved, ...sync };
   });
@@ -302,8 +402,7 @@ export async function updateNode({ nodeId, text, newText }, titleHint) {
   const finalText = newText ?? text;
   return withEditor(titleHint, async (cdp) => {
     const id = await resolveId(cdp, { nodeId, text });
-    const rect = await cdp.eval(`window.__ZX.rect(${JSON.stringify(id)})`);
-    if (!rect) throw new Error('节点不在可视区域，先调用 zhixi_read_tree 确认，或打开该分支');
+    const rect = await ensureClickable(cdp, id);
     await click(cdp, rect.x, rect.y, true);
     await sleep(700);
     await typeIntoEditor(cdp, finalText);

@@ -81,7 +81,7 @@ server.registerTool(
     inputSchema: {
       parentId: z.string().optional().describe('父节点 id（来自 zhixi_read_tree）'),
       parentText: z.string().optional().describe('父节点文字（必须全图唯一）'),
-      text: z.string().describe('新节点的文字'),
+      text: z.string().describe('新节点的文字。带公式时用 $...$ 包裹 LaTeX，例如 圆的方程：$x^2+y^2=r^2$'),
       mapId: z.string().optional().describe(`导图 id（同时打开多张时必传，来自 zhixi_status 或 zhixi_list_maps）`),
       mapTitle: z.string().optional().describe(`导图标题关键字`),
     },
@@ -97,7 +97,7 @@ server.registerTool(
     inputSchema: {
       parentId: z.string().optional().describe('父节点 id'),
       parentText: z.string().optional().describe('父节点文字（全图唯一）'),
-      texts: z.array(z.string()).describe('要添加的子节点文字列表'),
+      texts: z.array(z.string()).describe('要添加的子节点文字列表，每一项都支持 $...$ 公式语法'),
       mapId: z.string().optional().describe(`导图 id（同时打开多张时必传）`),
       mapTitle: z.string().optional().describe(`导图标题关键字`),
     },
@@ -113,7 +113,7 @@ server.registerTool(
     inputSchema: {
       nodeId: z.string().optional().describe('节点 id'),
       text: z.string().optional().describe('节点当前文字（必须全图唯一）'),
-      newText: z.string().describe('修改后的文字'),
+      newText: z.string().describe('修改后的文字，支持 $...$ 公式语法'),
       mapId: z.string().optional().describe(`导图 id（同时打开多张时必传，来自 zhixi_status 或 zhixi_list_maps）`),
       mapTitle: z.string().optional().describe(`导图标题关键字`),
     },

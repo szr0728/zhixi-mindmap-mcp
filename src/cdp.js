@@ -71,6 +71,18 @@ export class Cdp {
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// 把某个页面切到前台。后台标签页的 visibilityState 是 hidden，
+// 此时 Page.captureScreenshot 会一直等不到帧而超时（不是报错，是挂住）。
+export async function activateTarget(targetId) {
+  const v = await version();
+  const b = await Cdp.connect(v.webSocketDebuggerUrl);
+  try {
+    await b.send('Target.activateTarget', { targetId });
+  } finally {
+    b.close();
+  }
+}
+
 const EXE = process.env.ZHIXI_EXE || 'C:\\Program Files\\ZhiXi\\ZXMind\\zhiximind-desktop.exe';
 
 // 客户端没跑就拉起来（带调试端口）

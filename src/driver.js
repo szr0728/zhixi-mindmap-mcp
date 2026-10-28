@@ -1,5 +1,5 @@
 // 知犀驱动层：通过 CDP 操作运行中的客户端
-import { Cdp, listTargets, sleep, ensureClient } from './cdp.js';
+import { Cdp, listTargets, sleep, ensureClient, activateTarget } from './cdp.js';
 
 // 页面侧辅助脚本（幂等注入）
 const PAGE_HELPERS = `(() => {
@@ -498,11 +498,27 @@ export async function cloudCheck({ fileId, mapId, contains }) {
   };
 }
 
-export async function screenshot(titleHint, outPath) {  return withEditor(titleHint, async (cdp) => {
-    const shot = await cdp.send('Page.captureScreenshot', { format: 'png' });
+export async function screenshot(titleHint, outPath) {
+  return withEditor(titleHint, async (cdp, target) => {
+    // 后台标签页的 visibilityState 是 hidden，captureScreenshot 会一直等帧直到超时。
+    // 先把它切到前台，再截。
+    try { await activateTarget(target.id); } catch (e) { /* 切不过去也继续试 */ }
+    await sleep(800);
+    let vis = await cdp.eval('document.visibilityState').catch(() => 'unknown');
+    if (vis === 'hidden') {
+      await sleep(1800);
+      vis = await cdp.eval('document.visibilityState').catch(() => 'unknown');
+    }
+    let shot;
+    try {
+      shot = await cdp.send('Page.captureScreenshot', { format: 'png' });
+    } catch (e) {
+      throw new Error(`截图超时（页面可见性=${vis}）。这张图在后台标签页时 Chromium 不出帧，先在知犀里点一下它的标签页再试。`);
+    }
+    if (!shot || !shot.data) throw new Error('截图返回空数据');
     const { writeFileSync } = await import('node:fs');
     if (outPath) writeFileSync(outPath, Buffer.from(shot.data, 'base64'));
-    return { base64: shot.data, bytes: Math.round(shot.data.length * 0.75), path: outPath || null };
+    return { base64: shot.data, bytes: Math.round(shot.data.length * 0.75), path: outPath || null, visibility: vis };
   });
 }
 

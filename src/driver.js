@@ -3,7 +3,7 @@ import { Cdp, listTargets, sleep, ensureClient } from './cdp.js';
 
 // 页面侧辅助脚本（幂等注入）
 const PAGE_HELPERS = `(() => {
-  if (window.__ZX) return true;
+  if (window.__ZX && window.__ZX.__v === 2) return true;
   const protoFns = (o) => { const out = []; let p = o; while (p && p !== Object.prototype) { for (const k of Object.getOwnPropertyNames(p)) { if (k === 'constructor') continue; try { if (typeof o[k] === 'function') out.push(k); } catch (e) {} } p = Object.getPrototypeOf(p); } return [...new Set(out)]; };
   const findMM = () => {
     if (window.__ZX_MM && window.__ZX_MM.store) return window.__ZX_MM;
@@ -30,10 +30,33 @@ const PAGE_HELPERS = `(() => {
     kids.forEach((c) => flat(c, depth + 1, out, node.id));
     return out;
   };
+  // 完整读：把概要(summary)、外框(boundary)、备注、折叠状态都带上（只用于 read_tree，不影响写操作）
+  const flatFull = (node, depth, out, parentId, kind) => {
+    if (!node) return out;
+    const d = node.data || {};
+    const item = {
+      id: node.id,
+      text: String(d.text || '').replace(/\\n/g, '').trim(),
+      depth,
+      parentId: parentId || null,
+    };
+    if (kind && kind !== 'normal') item.kind = kind;
+    if (d.note) item.note = String(d.note).replace(/<[^>]+>/g, ' ').replace(/\\s+/g, ' ').trim().slice(0, 300);
+    if (d.todo) item.todo = d.todo;
+    if (d.expandState === 'collapse') item.collapsed = true;
+    out.push(item);
+    const kids = node.children || {};
+    ['normal', 'summary', 'boundary'].forEach((k) => {
+      (kids[k] || []).forEach((c) => flatFull(c, depth + 1, out, node.id, k));
+    });
+    return out;
+  };
   window.__ZX = {
+    __v: 2,
     mm: findMM,
     tree() { const mm = findMM(); if (!mm) return null; return mm.store.toJson(); },
     nodes() { const t = this.tree(); if (!t) return null; return flat(t.root, 0, [], null); },
+    fullNodes() { const t = this.tree(); if (!t) return null; return flatFull(t.root, 0, [], null, 'normal'); },
     title() { return document.title; },
     resolve(text) {
       const list = this.nodes() || [];
@@ -196,8 +219,15 @@ async function typeIntoEditor(cdp, text, fast = false) {
 export async function readTree(titleHint) {
   return withEditor(titleHint, async (cdp, target) => {
     const title = await cdp.eval('window.__ZX.title()');
-    const nodes = await cdp.eval('window.__ZX.nodes()');
-    return { mapTitle: title, id: (target.url.split('id=')[1] || ''), count: nodes.length, nodes };
+    const nodes = await cdp.eval('window.__ZX.fullNodes()');
+    const stats = {
+      total: nodes.length,
+      summary: nodes.filter((n) => n.kind === 'summary').length,
+      boundary: nodes.filter((n) => n.kind === 'boundary').length,
+      withNote: nodes.filter((n) => n.note).length,
+      collapsed: nodes.filter((n) => n.collapsed).length,
+    };
+    return { mapTitle: title, id: (target.url.split('id=')[1] || ''), count: nodes.length, stats, nodes };
   });
 }
 

@@ -80,17 +80,46 @@ const fk = rootEl && Object.keys(rootEl).find(k => k.startsWith('__react'));
 
 | 工具 | 说明 |
 |---|---|
-| `zhixi_status` | 连通性 + 当前打开了哪些导图 |
-| `zhixi_list_maps` | 云端完整文件夹树（19 个文件夹 / 37 个文件的实测规模），返回每个导图的路径 + fileId；可用 `folder` 只看某个目录 |
-| `zhixi_open_map` | 按 `path` / `fileId` / `title` 打开导图，走主进程 IPC，不依赖首页 DOM |
-| `zhixi_read_tree` | 导出全部节点（id / 文字 / 层级 / 父节点） |
-| `zhixi_add_node` | 在指定节点下新增子节点并写文字 |
+| `zhixi_status` | 连通性 + 当前打开了哪些导图（多张时会提示必须指定 mapId） |
+| `zhixi_list_maps` | 云端完整文件夹树，返回每个导图的路径 + fileId；可用 `folder` 只看某个目录 |
+| `zhixi_search_maps` | 按标题关键字搜索，返回路径 + fileId |
+| `zhixi_open_map` | 按 `path` / `fileId` / `title` 打开导图，走主进程 IPC |
+| `zhixi_create_map` | 新建导图（可指定标题与存放文件夹） |
+| `zhixi_create_folder` | 新建文件夹 |
+| `zhixi_rename_item` | 给导图或文件夹改名 |
+| `zhixi_move_item` | 移动到另一个文件夹 |
+| `zhixi_delete_item` | 移入回收站（必须 `confirm: true`） |
+| `zhixi_read_tree` | 导出节点树，含概要/外框/备注/折叠状态 |
+| `zhixi_add_node` | 新增单个子节点 |
+| `zhixi_add_nodes` | 批量新增同级子节点（比逐个调用快 3–4 倍） |
 | `zhixi_update_node` | 改节点文字 |
 | `zhixi_delete_node` | 删节点及子树（必须 `confirm: true`，返回被删子树） |
 | `zhixi_move_node` | 把节点移到另一个节点下 |
 | `zhixi_screenshot` | 截图当前画布 |
+| `zhixi_verify_synced` | 拉云端文件，确认文字真的落盘 |
 
 写操作建议用 `nodeId`。用文字定位时必须全图唯一，否则报错并列出候选 id——不做模糊匹配，避免删错。
+
+**多图保护**：同时打开多张导图时，所有节点操作必须带 `mapId`，否则直接报错并列出已打开的图。这是故意的——早期版本会默认取第一个窗口，存在改错图的风险。
+
+## 性能：mouseMoved 是毒药
+
+编辑器页面上，**每次 `Input.dispatchMouseEvent({type:'mouseMoved'})` 会阻塞约 5000ms**。不是网络、不是渲染慢，而是一个雷打不动的 5 秒——窗口被遮挡时 Chromium 等不到帧确认，就把这个输入卡住了。
+
+而 `mousePressed` / `mouseReleased` 只要 9ms。
+
+对比（同一台机器、同一张图）：
+
+| 操作 | 耗时 |
+|---|---|
+| mouseMoved + press + release | **5020 ms** |
+| 只发 press + release（不发 move） | **10 ms** |
+| 页面内 `el.click()` | 22 ms |
+
+所以 `driver.js` 的 `click()` 里**故意不发 mouseMoved**，只发按下和抬起。少了这一行，整个工具从"每步 7 秒"变成"每步 1.3 秒"。改动这行之前请先想清楚。
+
+顺带一提，节点选中用纯 press/release 也能生效，选中状态会在 `<g class="zx-node selected">` 上体现；但 SVG 节点上派发合成 `MouseEvent`（`new MouseEvent('click')`）**选不中**，应用不认。工具栏按钮反过来——`el.click()` 完全可行，比鼠标事件快 300 倍。
+
 
 ## 云文档目录：怎么拿到文件夹层级
 
@@ -112,8 +141,11 @@ const fk = rootEl && Object.keys(rootEl).find(k => k.startsWith('__react'));
 
 - 只支持 Windows（`tasklist` 检测进程、默认安装路径都是 Windows 的）。
 - 客户端必须处于登录态且能连上知犀服务器。
-- `zhixi_list_maps` 只列**云端**导图，本地文件（`.zxmind`）不在里面。
-- 同一文件夹里允许存在同名导图，这时 `open_map` 用 `path` 会报"匹配到多个"，要改用 `fileId`。
+- `zhixi_list_maps` / `zhixi_search_maps` 只覆盖**云端**导图，本地 `.zxmind` 文件不在里面。
+- 同一文件夹里允许存在同名导图，这时按 `path` / `title` 定位会报"匹配到多个"，要改用 `fileId`。
+- `zhixi_create_map` 走的是界面「新建 → 思维导图」，因为接口直接建档需要一整套模板参数。所以它会真的在屏幕上弹出新窗口。
+- 删除导图/文件夹只进回收站，不会物理删除，可从客户端还原。
+- 节点写入是模拟真人操作，**单节点约 1.3 秒**；批量新增 30 个节点约 40 秒。再快就需要改用应用内部的命令管道（`store.pipeCommands`），尚未实现。
 - 节点必须在可视区域内（脚本会尝试居中，折叠分支需先展开）。
 - **慢**：每次写操作模拟真人交互，单次 1–3 秒。批量改几十个节点会很难等，要快就得上直连注入，但那会牺牲同步可靠性。
 - 客户端是 MCP 进程的子进程，MCP 退出时可能被系统回收；下次调用会自动重启，但之前打开的导图窗口不在了，要重新 `open_map`。

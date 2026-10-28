@@ -67,16 +67,43 @@ const PAGE_HELPERS = `(() => {
   return true;
 })()`;
 
-async function attachEditor(titleHint) {
+const mapInfo = (e) => ({
+  title: (e.title && !/^editor\.html/.test(e.title)) ? e.title : '(标题加载中)',
+  fileId: (e.url || '').split('id=')[1] || null,
+});
+
+// hint 可以是 fileId（32 位十六进制，优先按 URL 精确匹配）或标题关键字
+async function attachEditor(hint) {
   await ensureClient();
   const targets = await listTargets();
   const editors = targets.filter((t) => (t.url || '').includes('editor.html') && t.type === 'page');
   if (!editors.length) throw new Error('当前没有打开的导图。请先用 zhixi_open_map 打开一张，或在客户端里手动打开。');
-  let t = editors[0];
-  if (titleHint) {
-    const hit = editors.find((e) => (e.title || '').includes(titleHint) || (e.url || '').includes(titleHint));
-    if (hit) t = hit;
+
+  let t = null;
+  if (hint) {
+    const h = String(hint).trim();
+    const byId = editors.filter((e) => (e.url || '').includes(h));
+    if (byId.length) t = byId[0];
+    if (!t) {
+      const byTitle = editors.filter((e) => (e.title || '').includes(h));
+      if (byTitle.length === 1) t = byTitle[0];
+      else if (byTitle.length > 1) {
+        throw new Error(`「${h}」匹配到 ${byTitle.length} 张已打开的导图，请改用 fileId 指定：` + byTitle.map((e) => `${mapInfo(e).fileId}(${mapInfo(e).title})`).join('、'));
+      }
+    }
+    if (!t) {
+      throw new Error(`没有找到「${h}」对应的已打开导图。当前打开的有：` + editors.map((e) => `${mapInfo(e).title}[${mapInfo(e).fileId}]`).join('、'));
+    }
+  } else if (editors.length === 1) {
+    t = editors[0];
+  } else {
+    // 多张图同时打开又没指定 —— 拒绝猜测，避免改错图
+    throw new Error(
+      `当前同时打开了 ${editors.length} 张导图，必须先指定要改哪一张（传 mapId 或 mapTitle）：\n`
+      + editors.map((e) => `- ${mapInfo(e).title}  fileId=${mapInfo(e).fileId}`).join('\n'),
+    );
   }
+
   const cdp = await Cdp.connect(t.webSocketDebuggerUrl);
   await cdp.send('Page.enable').catch(() => {});
   // 让被遮挡的窗口也保持渲染
@@ -97,9 +124,11 @@ export async function status() {
   await ensureClient();
   const targets = await listTargets();
   const editors = targets.filter((t) => (t.url || '').includes('editor.html'));
+  const maps = editors.map(mapInfo);
   return {
-    editors: editors.map((e) => ({ title: e.title, id: (e.url.split('id=')[1] || '') })),
+    editors: maps,
     hasHome: targets.some((t) => (t.url || '').includes('home.html')),
+    needSpecify: maps.length > 1,
   };
 }
 
@@ -119,6 +148,27 @@ async function keyPress(cdp, key, code, vk, modifiers = 0) {
   await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk, modifiers });
 }
 
+// 等编辑器回到「已保存」状态，确认改动真的落盘了（而不是只改了内存）
+async function waitSaved(cdp, timeout = 8000) {
+  const readState = `(() => {
+    const t = document.body.innerText || '';
+    if (/保存中|同步中/.test(t)) return 'saving';
+    if (/已保存|保存成功/.test(t)) return 'saved';
+    return 'unknown';
+  })()`;
+  await sleep(700); // 给 UI 一点时间切到「保存中」，否则会误判成已保存
+  const t0 = Date.now();
+  let sawSaving = false;
+  while (Date.now() - t0 < timeout) {
+    const st = await cdp.eval(readState).catch(() => 'unknown');
+    if (st === 'saving') sawSaving = true;
+    if (st === 'saved' && sawSaving) return { saved: true, ms: Date.now() - t0 };
+    if (st === 'saved' && !sawSaving && Date.now() - t0 > 2500) return { saved: true, ms: Date.now() - t0, note: '未观察到保存中状态（改动可能极快完成）' };
+    await sleep(400);
+  }
+  return { saved: false, ms: Date.now() - t0 };
+}
+
 async function selectNode(cdp, id) {
   let rect = await cdp.eval(`window.__ZX.rect(${JSON.stringify(id)})`);
   if (!rect) {
@@ -132,8 +182,7 @@ async function selectNode(cdp, id) {
   await sleep(250);
 }
 
-async function typeIntoEditor(cdp, text) {
-  const has = await cdp.eval('!!window.__ZX.editorBox()');
+async function typeIntoEditor(cdp, text) {  const has = await cdp.eval('!!window.__ZX.editorBox()');
   if (!has) throw new Error('没有进入文本编辑状态');
   await keyPress(cdp, 'a', 'KeyA', 65, 2); // Ctrl+A
   await sleep(120);
@@ -171,7 +220,8 @@ export async function addNode({ parentId, parentText, text }, titleHint) {
     await typeIntoEditor(cdp, text);
     const nodes = await cdp.eval('window.__ZX.nodes()');
     const created = nodes.filter((n) => n.text === text.replace(/\n/g, '').trim() && n.parentId === pid);
-    return { ok: true, parentId: pid, created: created[0] || null, count: nodes.length };
+    const sync = await waitSaved(cdp);
+    return { ok: true, parentId: pid, created: created[0] || null, count: nodes.length, synced: sync.saved, ...sync };
   });
 }
 
@@ -186,7 +236,8 @@ export async function updateNode({ nodeId, text, newText }, titleHint) {
     await typeIntoEditor(cdp, finalText);
     const nodes = await cdp.eval('window.__ZX.nodes()');
     const n = nodes.find((x) => x.id === id);
-    return { ok: true, nodeId: id, text: n ? n.text : finalText };
+    const sync = await waitSaved(cdp);
+    return { ok: true, nodeId: id, text: n ? n.text : finalText, synced: sync.saved, ...sync };
   });
 }
 
@@ -202,7 +253,8 @@ export async function deleteNode({ nodeId, text, confirm }, titleHint) {
     await keyPress(cdp, 'Delete', 'Delete', 46);
     await sleep(900);
     const after = await cdp.eval('window.__ZX.nodes()');
-    return { ok: true, deleted: { id, text: target.text, subtree }, remaining: after.length };
+    const sync = await waitSaved(cdp);
+    return { ok: true, deleted: { id, text: target.text, subtree }, remaining: after.length, synced: sync.saved, syncMs: sync.ms };
   });
 }
 
@@ -241,12 +293,40 @@ export async function moveNode({ nodeId, text, targetParentId, targetParentText 
       await selectNode(cdp, tid);
       throw new Error('移动未成功。节点可能还在剪贴板里，请重试或手动粘贴（Ctrl+V）。');
     }
-    return { ok: true, moved: moved.text, from: moved.parentId, to: tid, newId: now.id, count: after.length };
+    const sync = await waitSaved(cdp);
+    return { ok: true, moved: moved.text, from: moved.parentId, to: tid, newId: now.id, count: after.length, synced: sync.saved, syncMs: sync.ms };
   });
 }
 
-export async function screenshot(titleHint, outPath) {
-  return withEditor(titleHint, async (cdp) => {
+// 直接从云端取导图文件内容，验证"真的同步上去了"（不是只改了本地内存）
+export async function cloudCheck({ fileId, mapId, contains }) {
+  const id = fileId || mapId;
+  if (!id) throw new Error('需要提供 mapId（即导图 fileId）');
+  const cdp = await attachHome();
+  let meta;
+  try {
+    meta = await cdp.eval(`(async () => {
+      try {
+        const res = await window.__runtime.invoke('fs:open-file', { fileId: ${JSON.stringify(id)}, password: '' });
+        if (!res || !res.data) return { err: 'code=' + (res && res.code) };
+        return { title: res.data.title, url: res.data.content };
+      } catch (e) { return { err: String(e && e.message || e).slice(0, 160) }; }
+    })()`);
+  } finally { cdp.close(); }
+  if (!meta || !meta.url) throw new Error('取不到云端文件地址：' + ((meta && meta.err) || '未知错误'));
+
+  const text = await fetch(meta.url).then((r) => r.text());
+  const hit = contains ? text.includes(contains) : null;
+  return {
+    title: meta.title,
+    bytes: text.length,
+    checked: contains || null,
+    contains: hit,
+    note: contains ? (hit ? '云端文件里已包含该文字，说明改动真的落盘了' : '云端文件里没有找到这段文字，可能还在同步，稍等再试') : '仅确认文件可读取',
+  };
+}
+
+export async function screenshot(titleHint, outPath) {  return withEditor(titleHint, async (cdp) => {
     const shot = await cdp.send('Page.captureScreenshot', { format: 'png' });
     const { writeFileSync } = await import('node:fs');
     if (outPath) writeFileSync(outPath, Buffer.from(shot.data, 'base64'));

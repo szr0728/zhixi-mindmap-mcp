@@ -1,9 +1,11 @@
 // 知犀驱动层：通过 CDP 操作运行中的客户端
-import { Cdp, listTargets, sleep, ensureClient, activateTarget } from './cdp.js';
+import { Cdp, listTargets, sleep, ensureClient, activateTarget, parseFileId, getPort, getExePath } from './cdp.js';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { dirname, resolve as resolvePath } from 'node:path';
 
 // 页面侧辅助脚本（幂等注入）
 const PAGE_HELPERS = `(() => {
-  if (window.__ZX && window.__ZX.__v === 3) return true;
+  if (window.__ZX && window.__ZX.__v === 4) return true;
   const protoFns = (o) => { const out = []; let p = o; while (p && p !== Object.prototype) { for (const k of Object.getOwnPropertyNames(p)) { if (k === 'constructor') continue; try { if (typeof o[k] === 'function') out.push(k); } catch (e) {} } p = Object.getPrototypeOf(p); } return [...new Set(out)]; };
   const findMM = () => {
     if (window.__ZX_MM && window.__ZX_MM.store) return window.__ZX_MM;
@@ -66,11 +68,13 @@ const PAGE_HELPERS = `(() => {
     return out;
   };
   window.__ZX = {
-    __v: 3,
+    __v: 4,
     mm: findMM,
-    tree() { const mm = findMM(); if (!mm) return null; return mm.store.toJson(); },
-    nodes() { const t = this.tree(); if (!t) return null; return flat(t.root, 0, [], null); },
-    fullNodes() { const t = this.tree(); if (!t) return null; return flatFull(t.root, 0, [], null, 'normal'); },
+    // 同一个标签页切了别的导图时，缓存的实例会失效。清掉让它重新扫描。
+    reset() { window.__ZX_MM = null; return true; },
+    tree() { const mm = findMM(); if (!mm || !mm.store) return null; return mm.store.toJson(); },
+    nodes() { const t = this.tree(); if (!t || !t.root) return null; return flat(t.root, 0, [], null); },
+    fullNodes() { const t = this.tree(); if (!t || !t.root) return null; return flatFull(t.root, 0, [], null, 'normal'); },
     title() { return document.title; },
     resolve(text) {
       const list = this.nodes() || [];
@@ -106,8 +110,17 @@ const PAGE_HELPERS = `(() => {
 
 const mapInfo = (e) => ({
   title: (e.title && !/^editor\.html/.test(e.title)) ? e.title : '(标题加载中)',
-  fileId: (e.url || '').split('id=')[1] || null,
+  fileId: parseFileId(e.url),
 });
+
+// 写操作串行化。多个 MCP 调用并发时，它们共享同一个可见窗口和「当前选中节点」，
+// 交错执行会点到别的节点上去 —— 这是最危险的一类竞态，直接用队列消除。
+let writeChain = Promise.resolve();
+function serialize(fn) {
+  const run = writeChain.then(fn, fn); // 前一个失败也要继续，不然一次报错会卡死后续所有写入
+  writeChain = run.then(() => {}, () => {});
+  return run;
+}
 
 // hint 可以是 fileId（32 位十六进制，优先按 URL 精确匹配）或标题关键字
 async function attachEditor(hint) {
@@ -119,8 +132,14 @@ async function attachEditor(hint) {
   let t = null;
   if (hint) {
     const h = String(hint).trim();
+    if (!h) throw new Error('mapId / mapTitle 不能是空字符串');
     const byId = editors.filter((e) => (e.url || '').includes(h));
-    if (byId.length) t = byId[0];
+    if (byId.length === 1) t = byId[0];
+    else if (byId.length > 1) {
+      // 用短片段匹配到多张时不能猜，宁可报错
+      throw new Error(`「${h}」匹配到 ${byId.length} 张已打开的导图，请传完整 fileId：`
+        + byId.map((e) => `${mapInfo(e).fileId}(${mapInfo(e).title})`).join('、'));
+    }
     if (!t) {
       const byTitle = editors.filter((e) => (e.title || '').includes(h));
       if (byTitle.length === 1) t = byTitle[0];
@@ -142,14 +161,25 @@ async function attachEditor(hint) {
   }
 
   const cdp = await Cdp.connect(t.webSocketDebuggerUrl);
-  await cdp.send('Page.enable').catch(() => {});
-  // 让被遮挡的窗口也保持渲染
-  await cdp.send('Page.setWebLifecycleState', { state: 'active' }).catch(() => {});
-  await cdp.send('Emulation.setFocusEmulationEnabled', { enabled: true }).catch(() => {});
-  await cdp.eval(PAGE_HELPERS);
-  const ok = await cdp.eval('!!window.__ZX && !!window.__ZX.mm()');
-  if (!ok) { cdp.close(); throw new Error('页面已连接，但还没找到导图实例（可能仍在加载）。稍等几秒重试。'); }
-  return { cdp, target: t };
+  try {
+    await cdp.send('Page.enable').catch(() => {});
+    // 让被遮挡的窗口也保持渲染
+    await cdp.send('Page.setWebLifecycleState', { state: 'active' }).catch(() => {});
+    await cdp.send('Emulation.setFocusEmulationEnabled', { enabled: true }).catch(() => {});
+    await cdp.eval(PAGE_HELPERS).catch((e) => { throw new Error('注入页面辅助脚本失败：' + e.message); });
+
+    // 刚打开的导图可能还在加载，给几次机会再判定失败
+    let ok = false;
+    for (let i = 0; i < 3 && !ok; i++) {
+      ok = !!(await cdp.eval('!!window.__ZX && !!window.__ZX.mm()').catch(() => false));
+      if (!ok) await sleep(1200);
+    }
+    if (!ok) throw new Error('页面已连接，但还没找到导图实例（可能仍在加载，或这张图是空文档）。稍等几秒重试。');
+    return { cdp, target: t };
+  } catch (e) {
+    cdp.close();
+    throw e;
+  }
 }
 
 export async function withEditor(titleHint, fn) {
@@ -166,6 +196,9 @@ export async function status() {
     editors: maps,
     hasHome: targets.some((t) => (t.url || '').includes('home.html')),
     needSpecify: maps.length > 1,
+    port: getPort(),
+    exe: getExePath(),
+    exeExists: existsSync(getExePath()),
   };
 }
 
@@ -219,23 +252,39 @@ const PROBE_FN = (id) => `(() => {
   return { rect: r, ok: hit === id, why: hit === id ? 'ok' : 'hit:' + hit };
 })()`;
 
+// 把节点挪到视口中间，代价是画布会平移（用户能看到跳一下），所以只在必要时调用
+async function centerNode(cdp, id) {
+  return cdp.eval(`(() => {
+    const mm = window.__ZX.mm(); const id = ${JSON.stringify(id)};
+    try {
+      if (mm && mm.renderer && mm.renderer.moveNodeToViewCenter) mm.renderer.moveNodeToViewCenter(id);
+      else if (mm && mm.moveNodeToViewCenter) mm.moveNodeToViewCenter(id);
+      else return 'no-api';
+    } catch (e) { return 'err'; }
+    return 'ok';
+  })()`).catch(() => null);
+}
+
 async function ensureClickable(cdp, id) {
-  let st = await cdp.eval(PROBE_FN(id));
+  let st = await cdp.eval(PROBE_FN(id)).catch(() => null);
+  if (!st) throw new Error('探测节点位置时页面无响应，请重试：' + id);
   if (st.ok) return st.rect;
 
-  // 不在可点位置：把节点移到视图中心再试
-  for (let attempt = 0; attempt < 2 && !st.ok; attempt++) {
-    await cdp.eval(`(() => {
-      const mm = window.__ZX.mm(); const id = ${JSON.stringify(id)};
-      try {
-        if (mm.renderer && mm.renderer.moveNodeToViewCenter) mm.renderer.moveNodeToViewCenter(id);
-        else if (mm.moveNodeToViewCenter) mm.moveNodeToViewCenter(id);
-        else return 'no-api';
-      } catch (e) { return 'err'; }
-      return 'ok';
-    })()`);
-    await sleep(800);
-    st = await cdp.eval(PROBE_FN(id));
+  // 拿不到 DOM 位置时，可能是缓存了旧导图的实例（同一标签页切了别的图），清掉重新扫描
+  if (st.why === 'no-rect') {
+    await cdp.eval('window.__ZX.reset && window.__ZX.reset()').catch(() => {});
+    await sleep(300);
+    const again = await cdp.eval(PROBE_FN(id)).catch(() => null);
+    if (again && again.ok) return again.rect;
+    if (again) st = again;
+  }
+
+  for (let attempt = 0; attempt < 3 && !st.ok; attempt++) {
+    await centerNode(cdp, id);
+    await sleep(attempt === 0 ? 800 : 1200);
+    const next = await cdp.eval(PROBE_FN(id)).catch(() => null);
+    if (!next) break;
+    st = next;
   }
   if (!st.ok) {
     const where = st.rect ? `坐标 ${st.rect.x},${st.rect.y}` : '拿不到坐标';
@@ -250,9 +299,12 @@ async function selectNode(cdp, id) {
   await sleep(250);
 
   // 校验：点击后必须能在选中态里看到目标节点，否则宁可报错也不继续
-  const selIds = JSON.parse(await cdp.eval(
+  const rawSel = await cdp.eval(
     'JSON.stringify([...document.querySelectorAll("g.zx-node.selected")].map(g => g.getAttribute("data-node-id")))',
-  ) || '[]');
+  ).catch(() => '[]');
+  let selIds = [];
+  try { selIds = JSON.parse(rawSel || '[]'); } catch { selIds = []; }
+  if (!Array.isArray(selIds)) selIds = [];
   if (!selIds.includes(id)) {
     throw new Error(`点击未能选中目标节点（实际选中: ${selIds.length ? selIds.join(',') : '无'}），为避免改错节点已中止。nodeId=${id}`);
   }
@@ -262,7 +314,9 @@ async function selectNode(cdp, id) {
 // 例：'圆方程：$x^2+y^2=r^2$' ->
 //    [{insert:'圆方程：'}, {insert:{formula:'x^2+y^2=r^2'}}, {insert:'\n'}]
 export function textToDelta(text) {
-  const s = String(text == null ? '' : text);
+  // 支持用 \$ 表示字面美元号，否则「价格 $5 和 $6」会被误判成公式
+  const ESC = '\u0001';
+  const s = String(text == null ? '' : text).replace(/\\\$/g, ESC);
   const ops = [];
   const re = /\$([^$\n]+)\$/g;
   let last = 0;
@@ -274,6 +328,12 @@ export function textToDelta(text) {
   }
   const tail = s.slice(last);
   if (tail) ops.push({ insert: tail });
+  // 把占位符还原成真正的美元号
+  for (const op of ops) {
+    if (typeof op.insert === 'string' && op.insert.includes(ESC)) {
+      op.insert = op.insert.split(ESC).join('$');
+    }
+  }
 
   // 合并相邻的字符串 op
   const merged = [];
@@ -299,40 +359,70 @@ async function typeIntoEditor(cdp, text, fast = false) {
   const ready = await cdp.eval(
     '!!(document.querySelector(".ql-container") && document.querySelector(".ql-container").__quill)',
   );
-  if (!ready) throw new Error('没有进入文本编辑状态');
+  if (!ready) throw new Error('没有进入文本编辑状态（节点可能没被双击选中，或编辑器还没渲染完）');
   const delta = JSON.stringify(textToDelta(text));
   const raw = await cdp.eval(`(() => {
     const q = document.querySelector('.ql-container').__quill;
     try { q.setContents(${delta}, 'user'); return JSON.stringify({ ok: true, len: q.getLength() }); }
     catch (e) { return JSON.stringify({ ok: false, err: String(e && e.message || e).slice(0, 160) }); }
   })()`);
-  const res = JSON.parse(raw);
-  if (!res.ok) throw new Error('写入文本失败：' + res.err);
+  let res;
+  try { res = JSON.parse(raw); } catch { throw new Error('写入文本时页面返回了非预期结果: ' + String(raw).slice(0, 120)); }
+  if (!res || !res.ok) throw new Error('写入文本失败：' + ((res && res.err) || '未知原因'));
   await sleep(fast ? 110 : 250);
   await keyPress(cdp, 'Escape', 'Escape', 27);
   await sleep(fast ? 270 : 600);
 }
 
-export async function readTree(titleHint) {
+// 页面返回 null 说明导图还没就绪，这里统一转成可读错误，避免下游出现 "Cannot read properties of null"
+async function getNodes(cdp) {
+  const n = await cdp.eval('window.__ZX.nodes()');
+  if (!Array.isArray(n)) throw new Error('读不到节点树（导图可能还在加载，或页面已切走）。稍等几秒重试。');
+  return n;
+}
+
+// 比对文字时忽略空白差异，避免因换行/空格被判成失败
+const normText = (s) => String(s == null ? '' : s).replace(/\s+/g, '');
+
+export async function readTree(titleHint, { limit = 400 } = {}) {
+  const max = Number.isFinite(Number(limit)) && Number(limit) > 0 ? Math.floor(Number(limit)) : 400;
   return withEditor(titleHint, async (cdp, target) => {
     const title = await cdp.eval('window.__ZX.title()');
-    const nodes = await cdp.eval('window.__ZX.fullNodes()');
+    const all = await cdp.eval('window.__ZX.fullNodes()');
+    if (!Array.isArray(all)) throw new Error('读不到节点树（导图可能还在加载）。稍等几秒重试。');
     const stats = {
-      total: nodes.length,
-      summary: nodes.filter((n) => n.kind === 'summary').length,
-      boundary: nodes.filter((n) => n.kind === 'boundary').length,
-      withNote: nodes.filter((n) => n.note).length,
-      withFormula: nodes.filter((n) => n.hasFormula).length,
-      collapsed: nodes.filter((n) => n.collapsed).length,
+      total: all.length,
+      summary: all.filter((n) => n.kind === 'summary').length,
+      boundary: all.filter((n) => n.kind === 'boundary').length,
+      withNote: all.filter((n) => n.note).length,
+      withFormula: all.filter((n) => n.hasFormula).length,
+      collapsed: all.filter((n) => n.collapsed).length,
     };
-    return { mapTitle: title, id: (target.url.split('id=')[1] || ''), count: nodes.length, stats, nodes };
+    // 大图一次全吐出来会把调用方的上下文撑爆，超过上限就截断并明确告知
+    const nodes = all.slice(0, max);
+    const out = { mapTitle: title, id: parseFileId(target.url), count: all.length, stats, nodes };
+    if (nodes.length < all.length) {
+      out.truncated = true;
+      out.returned = nodes.length;
+      out.note = `节点太多，只返回前 ${nodes.length} 个（共 ${all.length}）。可以用 nodeId 精确定位，或调大 limit。`;
+    }
+    return out;
   });
 }
 
 async function resolveId(cdp, { nodeId, text }) {
-  if (nodeId) return nodeId;
-  if (!text) throw new Error('需要提供 nodeId 或 text');
+  // 给了 nodeId 就先校验它确实在当前导图里 —— 否则后续会以"点不中节点"这种费解的方式失败
+  if (nodeId && String(nodeId).trim()) {
+    const id = String(nodeId).trim();
+    const nodes = await getNodes(cdp);
+    if (!nodes.some((n) => n.id === id)) {
+      throw new Error(`nodeId=${id} 不在当前导图里（可能来自别的图，或该节点已被删除）。请先调用 zhixi_read_tree 重新获取。`);
+    }
+    return id;
+  }
+  if (!text || !String(text).trim()) throw new Error('需要提供 nodeId 或 text');
   const r = await cdp.eval(`(() => { const x = window.__ZX.resolve(${JSON.stringify(text)}); return { hits: x.hits.map(n => ({ id: n.id, text: n.text, depth: n.depth })), total: x.total }; })()`);
+  if (!r || !Array.isArray(r.hits)) throw new Error('按文字定位节点时页面返回异常，请改用 nodeId');
   if (!r.hits.length) throw new Error(`没有文字为「${text}」的节点。可以先调用 zhixi_read_tree 看看有哪些节点。`);
   if (r.hits.length > 1) throw new Error(`「${text}」匹配到 ${r.hits.length} 个节点，请改用 nodeId：` + r.hits.map((h) => `${h.id}(${h.text})`).join(', '));
   return r.hits[0].id;
@@ -343,26 +433,33 @@ export async function addNodes({ parentId, parentText, texts }, titleHint) {
   const list = (Array.isArray(texts) ? texts : []).map((t) => String(t == null ? '' : t).trim()).filter((t) => t);
   if (!list.length) throw new Error('texts 需要是非空的文字数组');
   if (list.length > 60) throw new Error('一次不要超过 60 个节点，分批调用更稳');
-  return withEditor(titleHint, async (cdp) => {
+  return serialize(() => withEditor(titleHint, async (cdp) => {
     const pid = await resolveId(cdp, { nodeId: parentId, text: parentText });
     await selectNode(cdp, pid);
     const t0 = Date.now();
-    const timings = [];
-    for (let i = 0; i < list.length; i++) {
-      const ti = Date.now();
-      const label = i === 0 ? '子主题' : '主题';
-      const btn = await cdp.eval(`window.__ZX.toolbarBtn(${JSON.stringify(label)})`);
-      const tQuery = Date.now() - ti;
-      if (!btn) throw new Error(`工具栏没找到「${label}」按钮`);
-      await click(cdp, btn.x, btn.y);
-      const tClick = Date.now() - ti;
-      await sleep(600);
-      await typeIntoEditor(cdp, list[i], true);
-      timings.push({ i, query: tQuery, clickDone: tClick, total: Date.now() - ti });
-      if (timings.length > 6) timings.shift();
-      if (process.env.ZHIXI_DEBUG) console.error('[timing]', JSON.stringify(timings[timings.length - 1]));
+    const done = [];
+    try {
+      for (let i = 0; i < list.length; i++) {
+        const label = i === 0 ? '子主题' : '主题';
+        const btn = await cdp.eval(`window.__ZX.toolbarBtn(${JSON.stringify(label)})`);
+        if (!btn) throw new Error(`工具栏没找到「${label}」按钮`);
+        await click(cdp, btn.x, btn.y);
+        await sleep(600);
+        await typeIntoEditor(cdp, list[i], true);
+        done.push(i);
+      }
+    } catch (e) {
+      // 中途失败时把已经加成功的报出来，避免调用方不知道图里多了什么
+      const rest = list.filter((_, i) => !done.includes(i));
+      const err = new Error(
+        `批量新增在第 ${done.length + 1} 个失败：${e.message}\n`
+        + `已成功添加 ${done.length} 个：${done.map((i) => list[i]).join('、') || '（无）'}\n`
+        + `未添加 ${rest.length} 个：${rest.join('、') || '（无）'}`,
+      );
+      err.partial = { added: done.map((i) => list[i]), failed: rest };
+      throw err;
     }
-    const nodes = await cdp.eval('window.__ZX.nodes()');
+    const nodes = await getNodes(cdp);
     const kids = nodes.filter((n) => n.parentId === pid).map((n) => ({ id: n.id, text: n.text }));
     const sync = await waitSaved(cdp);
     const ms = Date.now() - t0;
@@ -375,59 +472,92 @@ export async function addNodes({ parentId, parentText, texts }, titleHint) {
       children: kids,
       total: nodes.length,
       synced: sync.saved,
-      timings,
+      ...(sync.saved ? {} : { warning: '编辑器还没回到「已保存」状态，等几秒再用 zhixi_verify_synced 确认落盘' }),
     };
-  });
+  }));
 }
 
 export async function addNode({ parentId, parentText, text }, titleHint) {
-  return withEditor(titleHint, async (cdp) => {
+  const t = String(text == null ? '' : text);
+  if (!t.trim()) throw new Error('节点文字不能为空');
+  return serialize(() => withEditor(titleHint, async (cdp) => {
     const pid = await resolveId(cdp, { nodeId: parentId, text: parentText });
-    const beforeIds = new Set((await cdp.eval('window.__ZX.nodes()') || []).map((n) => n.id));
+    const beforeIds = new Set((await getNodes(cdp)).map((n) => n.id));
     await selectNode(cdp, pid);
     const btn = await cdp.eval(`window.__ZX.toolbarBtn('子主题')`);
     if (!btn) throw new Error('工具栏没找到「子主题」按钮');
     await click(cdp, btn.x, btn.y);
     await sleep(800);
-    await typeIntoEditor(cdp, text);
-    const nodes = await cdp.eval('window.__ZX.nodes()');
+    await typeIntoEditor(cdp, t);
+    const nodes = await getNodes(cdp);
     // 按「新增的 id」判断，不用文字比对（公式会被还原成 $...$，比对容易失配）
     const created = nodes.filter((n) => n.parentId === pid && !beforeIds.has(n.id));
     const sync = await waitSaved(cdp);
-    return { ok: true, parentId: pid, created: created[0] || null, count: nodes.length, synced: sync.saved, ...sync };
-  });
+    if (!created.length) {
+      throw new Error('点了「子主题」也输入了文字，但没有出现新节点。可能编辑态被中断，请重试；若反复失败，手动看一眼客户端。');
+    }
+    return {
+      ok: true, parentId: pid, created: created[0] || null, count: nodes.length, synced: sync.saved,
+      ...(sync.saved ? {} : { warning: '编辑器还没回到「已保存」状态，等几秒再用 zhixi_verify_synced 确认落盘' }),
+    };
+  }));
 }
 
 export async function updateNode({ nodeId, text, newText }, titleHint) {
-  const finalText = newText ?? text;
-  return withEditor(titleHint, async (cdp) => {
+  const finalText = String(newText ?? text ?? '');
+  if (!finalText.trim()) throw new Error('新文字不能为空（清空内容请用 zhixi_delete_node）');
+  return serialize(() => withEditor(titleHint, async (cdp) => {
     const id = await resolveId(cdp, { nodeId, text });
     const rect = await ensureClickable(cdp, id);
     await click(cdp, rect.x, rect.y, true);
     await sleep(700);
     await typeIntoEditor(cdp, finalText);
-    const nodes = await cdp.eval('window.__ZX.nodes()');
+    const nodes = await getNodes(cdp);
     const n = nodes.find((x) => x.id === id);
     const sync = await waitSaved(cdp);
-    return { ok: true, nodeId: id, text: n ? n.text : finalText, synced: sync.saved, ...sync };
-  });
+    // 写完必须校对：改到别的节点、或被云端回滚，都应该明确报错而不是假装成功
+    const actual = n ? n.text : '';
+    if (normText(actual) !== normText(finalText)) {
+      throw new Error(
+        `文字写入后校对不一致。\n期望：${finalText}\n实际：${actual || '（节点已找不到）'}\n`
+        + '可能是编辑器还在提交或该节点被并发修改，请先用 zhixi_read_tree 确认当前内容再重试。',
+      );
+    }
+    return { ok: true, nodeId: id, text: actual, verified: true, synced: sync.saved };
+  }));
 }
 
 export async function deleteNode({ nodeId, text, confirm }, titleHint) {
   if (!confirm) throw new Error('删除是破坏性操作：请先调用 zhixi_read_tree 确认节点，然后传 confirm=true 再执行。');
-  return withEditor(titleHint, async (cdp) => {
+  return serialize(() => withEditor(titleHint, async (cdp) => {
     const id = await resolveId(cdp, { nodeId, text });
-    const before = await cdp.eval('window.__ZX.nodes()');
+    const before = await getNodes(cdp);
     const target = before.find((n) => n.id === id);
     if (!target) throw new Error('节点不存在: ' + id);
     const subtree = collectSubtree(before, id);
     await selectNode(cdp, id);
     await keyPress(cdp, 'Delete', 'Delete', 46);
     await sleep(900);
-    const after = await cdp.eval('window.__ZX.nodes()');
+    const after = await getNodes(cdp);
     const sync = await waitSaved(cdp);
-    return { ok: true, deleted: { id, text: target.text, subtree }, remaining: after.length, synced: sync.saved, syncMs: sync.ms };
-  });
+    // 必须确认真的删掉了：选中态丢失时 Delete 键会被页面吞掉，不校验就会误报成功
+    if (after.some((n) => n.id === id)) {
+      throw new Error(
+        `按了 Delete 但节点还在（选中态可能被中断，未删除任何内容）。`
+        + `节点「${target.text}」nodeId=${id}。请重试。`,
+      );
+    }
+    const expectedLeft = before.length - subtree.length;
+    return {
+      ok: true,
+      deleted: { id, text: target.text, subtree },
+      remaining: after.length,
+      subtreeCount: subtree.length,
+      // 少太多说明可能连带删了别的东西，报出来让人核对
+      ...(after.length === expectedLeft ? {} : { warning: `删除前 ${before.length} 个节点，删掉 ${subtree.length} 个子树节点，现在 ${after.length} 个，与预期 ${expectedLeft} 不一致，请核对` }),
+      synced: sync.saved,
+    };
+  }));
 }
 
 function collectSubtree(nodes, id) {
@@ -443,31 +573,49 @@ function collectSubtree(nodes, id) {
 }
 
 export async function moveNode({ nodeId, text, targetParentId, targetParentText }, titleHint) {
-  return withEditor(titleHint, async (cdp) => {
+  return serialize(() => withEditor(titleHint, async (cdp) => {
     const id = await resolveId(cdp, { nodeId, text });
     const tid = await resolveId(cdp, { nodeId: targetParentId, text: targetParentText });
-    const before = await cdp.eval('window.__ZX.nodes()');
+    const before = await getNodes(cdp);
     const moved = before.find((n) => n.id === id);
-    if (!moved) throw new Error('节点不存在: ' + id);
+    const target = before.find((n) => n.id === tid);
+    if (!moved) throw new Error('要移动的节点不存在: ' + id);
+    if (!target) throw new Error('目标父节点不存在: ' + tid);
     if (id === tid) throw new Error('不能移动到自身下面');
+    // 目标在自己子树里会造成环，这种移动必须拦下来
+    const subIds = new Set(collectSubtree(before, id).map((n) => n.id));
+    if (subIds.has(tid)) throw new Error(`目标节点「${target.text}」在被移动节点自己的子树里，这样的移动不合法。`);
 
     await selectNode(cdp, id);
     await keyPress(cdp, 'x', 'KeyX', 88, 2); // Ctrl+X
     await sleep(700);
-    await selectNode(cdp, tid);
-    await keyPress(cdp, 'v', 'KeyV', 86, 2); // Ctrl+V
-    await sleep(1200);
 
-    const after = await cdp.eval('window.__ZX.nodes()');
-    const now = after.find((n) => n.text === moved.text && n.parentId === tid);
-    if (!now) {
-      // 兜底：粘回原位，避免节点丢失
+    // 剪切后节点已经在剪贴板里，粘贴失败就等于节点"悬空"。
+    // 所以这里必须重试，并把最终状态如实报出来，不能含糊地说"未成功"。
+    const beforeIds = new Set(before.map((n) => n.id));
+    let after = null;
+    let now = null;
+    for (let attempt = 0; attempt < 2 && !now; attempt++) {
       await selectNode(cdp, tid);
-      throw new Error('移动未成功。节点可能还在剪贴板里，请重试或手动粘贴（Ctrl+V）。');
+      await keyPress(cdp, 'v', 'KeyV', 86, 2); // Ctrl+V
+      await sleep(1400);
+      after = await getNodes(cdp);
+      // 粘贴通常会生成新 id，所以按「父节点是目标 + 文字相同 + id 是新的」来认
+      const cands = after.filter((n) => n.parentId === tid && n.text === moved.text);
+      now = cands.find((n) => !beforeIds.has(n.id)) || cands.find((n) => n.id === id) || null;
+    }
+    if (!now) {
+      throw new Error(
+        `移动未完成：节点「${moved.text}」已经剪切，但没能粘贴到「${target.text}」下面。\n`
+        + `请重试 zhixi_move_node，或立刻在客户端里选中「${target.text}」按 Ctrl+V 粘回去。`,
+      );
     }
     const sync = await waitSaved(cdp);
-    return { ok: true, moved: moved.text, from: moved.parentId, to: tid, newId: now.id, count: after.length, synced: sync.saved, syncMs: sync.ms };
-  });
+    return {
+      ok: true, moved: moved.text, from: moved.parentId, to: tid, toText: target.text,
+      newId: now.id, count: after.length, synced: sync.saved,
+    };
+  }));
 }
 
 // 直接从云端取导图文件内容，验证"真的同步上去了"（不是只改了本地内存）
@@ -487,26 +635,39 @@ export async function cloudCheck({ fileId, mapId, contains }) {
   } finally { cdp.close(); }
   if (!meta || !meta.url) throw new Error('取不到云端文件地址：' + ((meta && meta.err) || '未知错误'));
 
-  const text = await fetch(meta.url).then((r) => r.text());
+  let text;
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 15000);
+    const res = await fetch(meta.url, { signal: ctrl.signal });
+    clearTimeout(timer);
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    text = await res.text();
+  } catch (e) {
+    throw new Error(`下载云端文件失败：${e.message}（网络问题可稍后重试；文件本身大概率没问题）`);
+  }
+
   const hit = contains ? text.includes(contains) : null;
   return {
     title: meta.title,
     bytes: text.length,
     checked: contains || null,
     contains: hit,
-    note: contains ? (hit ? '云端文件里已包含该文字，说明改动真的落盘了' : '云端文件里没有找到这段文字，可能还在同步，稍等再试') : '仅确认文件可读取',
+    note: contains
+      ? (hit ? '云端文件里已包含该文字，说明改动真的落盘了' : '云端文件里没有找到这段文字，可能还在同步，隔几秒再试一次')
+      : '仅确认文件可读取',
   };
 }
 
 export async function screenshot(titleHint, outPath) {
   return withEditor(titleHint, async (cdp, target) => {
     // 后台标签页的 visibilityState 是 hidden，captureScreenshot 会一直等帧直到超时。
-    // 先把它切到前台，再截。
-    try { await activateTarget(target.id); } catch (e) { /* 切不过去也继续试 */ }
-    await sleep(800);
+    // 只有真的 hidden 才去切前台 —— 无谓地激活标签页会打乱用户正在看的页面。
     let vis = await cdp.eval('document.visibilityState').catch(() => 'unknown');
+    let activated = false;
     if (vis === 'hidden') {
-      await sleep(1800);
+      try { await activateTarget(target.id); activated = true; } catch { /* 切不过去也继续试 */ }
+      await sleep(1200);
       vis = await cdp.eval('document.visibilityState').catch(() => 'unknown');
     }
     let shot;
@@ -516,9 +677,24 @@ export async function screenshot(titleHint, outPath) {
       throw new Error(`截图超时（页面可见性=${vis}）。这张图在后台标签页时 Chromium 不出帧，先在知犀里点一下它的标签页再试。`);
     }
     if (!shot || !shot.data) throw new Error('截图返回空数据');
-    const { writeFileSync } = await import('node:fs');
-    if (outPath) writeFileSync(outPath, Buffer.from(shot.data, 'base64'));
-    return { base64: shot.data, bytes: Math.round(shot.data.length * 0.75), path: outPath || null, visibility: vis };
+    let abs = null;
+    if (outPath) {
+      abs = resolvePath(String(outPath));
+      // 目录不存在就直接写会抛 ENOENT，先补出来
+      try {
+        mkdirSync(dirname(abs), { recursive: true });
+        writeFileSync(abs, Buffer.from(shot.data, 'base64'));
+      } catch (e) {
+        throw new Error(`截图成功但保存失败（${abs}）：${e.message}。可以把 savePath 换到有写权限的目录。`);
+      }
+    }
+    return {
+      base64: shot.data,
+      bytes: Math.round(shot.data.length * 0.75),
+      path: abs,
+      visibility: vis,
+      ...(activated ? { note: '这张图原来在后台标签页，为了出帧已把它切到前台' } : {}),
+    };
   });
 }
 
@@ -532,8 +708,9 @@ async function homeInvoke(cdp, channel, arg) {
   })()`);
   if (!r.ok) throw new Error(`调用 ${channel} 失败：${r.err}`);
   const res = r.res;
-  if (res && typeof res.code === 'number' && res.code !== 0) {
-    throw new Error(`${channel} 返回错误 code=${res.code}` + (res.message ? `：${res.message}` : ''));
+  const code = res && res.code;
+  if (code !== undefined && code !== null && Number(code) !== 0) {
+    throw new Error(`${channel} 返回错误 code=${code}` + (res.message ? `：${res.message}` : ''));
   }
   return res && 'data' in res ? res.data : res;
 }
@@ -546,7 +723,10 @@ async function resolveItem(cdp, { fileId, path, title, wantFolder = null }) {
 
   if (fileId) {
     const hit = pool.find((it) => it.fileId === fileId);
-    return hit || { fileId, title: title || '', id: null, path: null, isFolder: wantFolder === true };
+    if (hit) return hit;
+    // 要的是文件夹却找不到时不能退回 stub —— 调用方会拿到 id=null 然后默默建到根目录
+    if (wantFolder) throw new Error(`fileId=${fileId} 不是文件夹，或该文件夹已不在当前目录里。可以先用 zhixi_list_maps 核对。`);
+    return { fileId, title: title || '', id: null, path: null, isFolder: false };
   }
   if (path) {
     const hit = pool.filter((it) => norm(it.path) === norm(String(path).replace(/^\/+|\/+$/g, '')));
@@ -567,69 +747,75 @@ async function resolveItem(cdp, { fileId, path, title, wantFolder = null }) {
 
 const ROOT_PID = 0;
 
+// 解析目标文件夹 → parentId。空路径等于根目录；给了路径却解析不出 id 时直接报错，
+// 绝不静默退回根目录（否则"建在指定文件夹"会变成"建在根目录"这种静默错误）。
+async function folderPid(cdp, folderPath) {
+  const p = String(folderPath || '').trim();
+  if (!p) return ROOT_PID;
+  const parent = await resolveItem(cdp, { path: p, wantFolder: true });
+  const pid = parent && parent.id;
+  if (pid === null || pid === undefined) {
+    throw new Error(`找不到文件夹「${p}」，请先用 zhixi_list_maps 确认完整路径。`);
+  }
+  return pid;
+}
+
 export async function createFolder({ title, folder, parentPath }) {
-  if (!title || !String(title).trim()) throw new Error('文件夹名不能为空');
+  const name = String(title == null ? '' : title).trim();
+  if (!name) throw new Error('文件夹名不能为空');
   const cdp = await attachHome();
   try {
-    let pid = ROOT_PID;
-    if (folder || parentPath) {
-      const parent = await resolveItem(cdp, { path: parentPath || folder, wantFolder: true });
-      pid = parent.id;
-    }
-    const fileId = await homeInvoke(cdp, 'fs:create-folder', { title: String(title).trim(), pid, password: '' });
+    const pid = await folderPid(cdp, parentPath || folder);
+    const fileId = await homeInvoke(cdp, 'fs:create-folder', { title: name, pid, password: '' });
+    if (!fileId) throw new Error('接口没有返回新文件夹的 fileId，创建可能没生效，请到客户端确认一眼');
     await sleep(1200);
     const all = flattenTree(await fetchTree(cdp));
     const created = all.find((it) => it.fileId === fileId) || null;
-    return { ok: true, title, fileId, path: created ? created.path : null, parentId: pid };
+    return { ok: true, title: name, fileId, path: created ? created.path : null, parentId: pid };
   } finally { cdp.close(); }
 }
 
-// 新建导图：走界面「新建 → 思维导图」，再用接口改名/归位（接口直接建档需要模板参数，暂时走这条稳的路）
-export async function createMap({ title, folder, parentPath }) {
-  const before = (await listTargets()).filter((t) => (t.url || '').includes('editor.html')).map((t) => (t.url || '').split('id=')[1]);
-  const cdp = await attachHome();
-  let newId = null;
-  try {
-    const clickText = async (text) => {
-      const pos = await cdp.eval(`(() => {
-        const cands = [...document.querySelectorAll('div,span,button,a')].filter((el) => {
-          const t = (el.textContent || '').trim();
-          if (t !== ${JSON.stringify(text)}) return false;
-          const r = el.getBoundingClientRect();
-          return r.width > 8 && r.height > 8 && r.width < 400;
-        });
-        if (!cands.length) return null;
-        cands.sort((a, b) => a.querySelectorAll('*').length - b.querySelectorAll('*').length);
-        const r = cands[0].getBoundingClientRect();
-        return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) };
-      })()`);
-      if (!pos) return false;
-      await click(cdp, pos.x, pos.y);
-      return true;
-    };
-    if (!(await clickText('新建'))) throw new Error('首页没找到「新建」按钮');
-    await sleep(1800);
-    if (!(await clickText('思维导图'))) throw new Error('模板页没找到「思维导图」模板');
-    for (let i = 0; i < 30; i++) {
-      await sleep(700);
-      const now = (await listTargets()).filter((t) => (t.url || '').includes('editor.html')).map((t) => (t.url || '').split('id=')[1]);
-      newId = now.find((id) => id && !before.includes(id));
-      if (newId) break;
-    }
-    if (!newId) throw new Error('点了新建但没等到编辑器窗口出现');
+// 新建导图：直接调主进程的 fs:create-file 接口建档，不再模拟点击界面。
+// 之前走 UI 点「新建 → 思维导图」会被侧边栏的悬浮提示抢掉点击，且模板卡片是 hover 触发的，
+// 版本一改就点不动 —— 接口方式只依赖一个稳定的 channel，参数也已经被实测确认。
+export function createMap({ title, folder, parentPath, structure = 'none', open = true }) {
+  return serialize(async () => {
+    const cdp = await attachHome();
+    try {
+      const pid = await folderPid(cdp, parentPath || folder);
+      const res = await homeInvoke(cdp, 'fs:create-file', {
+        data: { type: 'structure', structure: String(structure || 'none'), trackFrom: 'zhixi-mcp' },
+        pid,
+      });
+      const fileId = res && res.fileId;
+      if (!fileId) throw new Error('新建接口没有返回 fileId，创建可能没成功（返回: ' + JSON.stringify(res).slice(0, 120) + '）');
 
-    let pid = null;
-    if (folder || parentPath) {
-      const parent = await resolveItem(cdp, { path: parentPath || folder, wantFolder: true });
-      pid = parent.id;
-    }
-    if (title) await homeInvoke(cdp, 'fs:rename-file', { title: String(title).trim(), fileId: newId, password: '' });
-    if (pid !== null) await homeInvoke(cdp, 'fs:move-files', { dest: pid, fileIds: [newId], password: '' });
-    await sleep(1500);
-    const all = flattenTree(await fetchTree(cdp));
-    const created = all.find((it) => it.fileId === newId);
-    return { ok: true, fileId: newId, title: title || (created && created.title) || '(未命名)', path: created ? created.path : null };
-  } finally { cdp.close(); }
+      const name = String(title == null ? '' : title).trim();
+      if (name) await homeInvoke(cdp, 'fs:rename-file', { title: name, fileId, password: '' });
+      if (pid !== ROOT_PID) await homeInvoke(cdp, 'fs:move-files', { dest: pid, fileIds: [fileId], password: '' });
+      await sleep(1200);
+
+      const all = flattenTree(await fetchTree(cdp));
+      const created = all.find((it) => it.fileId === fileId) || null;
+
+      // 顺手打开它，方便紧接着写节点；打不开不算失败
+      let openErr = null;
+      if (open) {
+        const o = await openByFileId(cdp, { fileId, title: name || (created && created.title) || '' });
+        if (!o.target) openErr = o.err || '未知';
+      }
+
+      return {
+        ok: true,
+        fileId,
+        title: name || (created && created.title) || '(未命名)',
+        path: created ? created.path : null,
+        opened: open ? !openErr : false,
+        ...(openErr ? { warning: '导图已创建，但自动打开失败（' + openErr + '）。可以用 zhixi_open_map 再打开。' } : {}),
+        ...(created ? {} : { warning: '新导图已创建，但目录树里暂时看不到（可能还在同步）。稍后用 zhixi_list_maps 核对。' }),
+      };
+    } finally { cdp.close(); }
+  });
 }
 
 export async function renameItem({ fileId, path, title, newTitle }) {
@@ -649,26 +835,54 @@ export async function moveItems({ fileId, path, title, toFolder, toPath }) {
   const cdp = await attachHome();
   try {
     const item = await resolveItem(cdp, { fileId, path, title });
-    let dest = ROOT_PID;
-    let destPath = '';
-    if (toFolder !== undefined || toPath !== undefined) {
-      const parent = await resolveItem(cdp, { path: toPath || toFolder, wantFolder: true });
-      dest = parent.id;
-      destPath = parent.path;
+    if (!item.fileId) throw new Error('解析不到要移动条目的 fileId，请改用 fileId 直接指定');
+    const dest = await folderPid(cdp, toPath || toFolder);
+    const all0 = flattenTree(await fetchTree(cdp));
+    const destNode = all0.find((it) => it.id === dest);
+    const destPath = destNode ? destNode.path : '';
+
+    // 把文件夹移进自己或自己的子孙里会造成循环，知犀不一定拦，这里必须前置拦截
+    if (dest !== ROOT_PID) {
+      if (item.isFolder && destPath && (destPath === item.path || destPath.startsWith(item.path + '/'))) {
+        throw new Error(`不能把文件夹「${item.path}」移动到它自己或它的子目录「${destPath}」里。`);
+      }
+      if (destNode && destNode.fileId === item.fileId) {
+        throw new Error('目标文件夹就是它自己，不需要移动。');
+      }
     }
+
     await homeInvoke(cdp, 'fs:move-files', { dest, fileIds: [item.fileId], password: '' });
     await sleep(1500);
     const all = flattenTree(await fetchTree(cdp));
     const now = all.find((it) => it.fileId === item.fileId);
-    return { ok: true, fileId: item.fileId, title: item.title, to: destPath || '(根目录)', path: now ? now.path : null };
+    if (!now) {
+      throw new Error('移动接口已执行，但结算时在目录树里找不到这个条目了。请在客户端确认一下（大概率只是列表还没刷新）。');
+    }
+    return { ok: true, fileId: item.fileId, title: item.title, to: destPath || '(根目录)', path: now.path };
   } finally { cdp.close(); }
 }
 
 export async function deleteItem({ fileId, path, title, confirm }) {
-  if (!confirm) throw new Error('删除是破坏性操作：请先确认目标，然后传 confirm=true。文件会进知犀回收站，可从客户端还原。');
   const cdp = await attachHome();
   try {
     const item = await resolveItem(cdp, { fileId, path, title });
+    if (!item.fileId) throw new Error('解析不到要删除条目的 fileId，请改用 fileId 直接指定');
+
+    // 没确认时不是直接报错，而是把将被删除的东西（含子项数量）报回去，让调用方能安全地二次确认
+    if (!confirm) {
+      const all0 = flattenTree(await fetchTree(cdp));
+      const desc = item.isFolder
+        ? all0.filter((it) => it.path.startsWith(item.path + '/'))
+        : [];
+      return {
+        ok: false,
+        needConfirm: true,
+        target: { title: item.title, path: item.path, isFolder: item.isFolder, fileId: item.fileId },
+        ...(item.isFolder ? { descendantCount: desc.length, descendants: desc.slice(0, 20).map((d) => d.path) } : {}),
+        note: '这是破坏性操作（会连同子项一起移入知犀回收站）。确认无误后带 confirm=true 再调用一次。',
+      };
+    }
+
     await homeInvoke(cdp, 'fs:mark-file-deleted', { fileIds: [item.fileId], password: '' });
     await sleep(1500);
     const all = flattenTree(await fetchTree(cdp));
@@ -676,7 +890,7 @@ export async function deleteItem({ fileId, path, title, confirm }) {
     return {
       ok: !stillThere,
       deleted: { title: item.title, path: item.path, isFolder: item.isFolder, fileId: item.fileId },
-      note: stillThere ? '接口返回成功但目录里还能看到，可能尚未刷新，请稍后复查' : '已移入回收站',
+      note: stillThere ? '接口返回成功但目录里还能看到，可能尚未刷新，请稍后复查' : '已移入回收站，可在知犀客户端还原',
     };
   } finally { cdp.close(); }
 }
@@ -724,18 +938,20 @@ async function fetchTree(cdp) {
       return await window.__runtime.invoke('fs:query-file-tree', { recursive: true, includeFiles: true });
     } catch (e) { return { code: -1, message: String(e && e.message || e) }; }
   })()`);
-  if (!raw || raw.code !== 0) {
-    throw new Error('获取云文档目录失败：' + JSON.stringify(raw).slice(0, 160));
+  if (!raw || raw.code === undefined || Number(raw.code) !== 0) {
+    throw new Error('获取云文档目录失败：' + JSON.stringify(raw).slice(0, 160)
+      + '（如果反复失败，可能是客户端还没登录或首页没加载完，稍等几秒重试）');
   }
-  return raw.data || [];
+  return Array.isArray(raw.data) ? raw.data : [];
 }
 
 // 把嵌套树拍平成带完整路径的列表；type 0 = 文件夹，1 = 导图文件
 function flattenTree(nodes, parentPath = '') {
   const out = [];
   for (const n of nodes) {
-    const isFolder = n.type === 0;
-    const title = (n.title || '').trim() || '(未命名)';
+    if (!n) continue;
+    const isFolder = Number(n.type) === 0; // 接口有时给字符串 "0"，直接 === 0 会漏判
+    const title = String(n.title || '').trim() || '(未命名)';
     const path = parentPath ? `${parentPath}/${title}` : title;
     out.push({
       path,
@@ -804,19 +1020,52 @@ async function openByFileId(cdp, node) {
     opentab: true,
     filepath: null,
   };
-  const r = await cdp.eval(`(async () => {
-    try { return { ok: true, r: await window.__runtime.invoke('wm:r-open-file', ${JSON.stringify(arg)}) }; }
-    catch (e) { return { ok: false, err: String(e && e.message || e) }; }
-  })()`);
-  if (!r.ok) return { target: null, err: r.err };
 
-  for (let i = 0; i < 24; i++) {
-    await sleep(500);
-    const targets = await listTargets();
-    const hit = targets.find((t) => (t.url || '').includes('editor.html') && (t.url || '').includes(node.fileId));
-    if (hit) return { target: hit };
+  const invoke = () => cdp.eval(`(async () => {
+    try { return { ok: true, r: await window.__runtime.invoke('wm:r-open-file', ${JSON.stringify(arg)}) }; }
+    catch (e) { return { ok: false, err: String(e && e.message || e).slice(0, 160) }; }
+  })()`);
+
+  const waitEditor = async () => {
+    for (let i = 0; i < 20; i++) {
+      await sleep(500);
+      const targets = await listTargets();
+      const hit = targets.find((t) => (t.url || '').includes('editor.html') && (t.url || '').includes(node.fileId));
+      if (hit) return { target: hit };
+    }
+    return null;
+  };
+
+  let lastErr = null;
+  let activatedHome = false;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt) await sleep(1400); // 刚建的文件可能还没进索引
+    let r;
+    try { r = await invoke(); } catch (e) { lastErr = e.message; continue; }
+
+    if (!r || !r.ok) {
+      lastErr = (r && r.err) || '调用失败';
+      // 主进程找不到"当前活跃窗口"时就是这个 getURL 报错。
+      // 只在失败时才去激活首页，避免无谓地改用户的标签页状态。
+      if (!activatedHome && /getURL|undefined/.test(lastErr)) {
+        activatedHome = true;
+        const home = (await listTargets().catch(() => [])).find((t) => (t.url || '').includes('home.html'));
+        if (home) await activateTarget(home.id).catch(() => {});
+        await sleep(600);
+      }
+      continue;
+    }
+
+    const code = r.r && r.r.code;
+    if (code !== undefined && code !== null && Number(code) !== 0 && Number(code) !== 200) {
+      lastErr = `open-file 返回 code=${code}`;
+      continue;
+    }
+    const hit = await waitEditor();
+    if (hit) return hit;
+    lastErr = '调用成功但编辑器窗口迟迟没出现';
   }
-  return { target: null, err: '调用成功但编辑器窗口迟迟没出现' };
+  return { target: null, err: lastErr || '未知错误' };
 }
 
 const findTitleInHome = `(() => {
@@ -897,16 +1146,23 @@ export async function openMap({ title, path, fileId } = {}) {
       };
     }
 
-    // 兜底走 UI 点击
+    // 兜底走 UI 点击，但必须核对打开的 fileId —— 曾经这里直接取"最后一个编辑器窗口"，
+    // 结果是打开失败却报成功，还把别人的图当成了目标，非常危险。
     const clicked = await openByClick(node.title);
-    if (!clicked) throw new Error(`按 fileId 打开失败（${opened.err || '未知'}），首页点击也找不到「${node.title}」`);
+    if (!clicked) {
+      throw new Error(`按 fileId 打开失败（${opened.err || '未知'}），首页点击也找不到「${node.title}」。\n`
+        + '可以稍等几秒重试；如果反复失败，重启知犀客户端再试（标签页状态可能异常）。');
+    }
     const targets = await listTargets();
-    const ed = targets.filter((t) => (t.url || '').includes('editor.html'));
-    const hit = ed.find((e) => (e.title || '').includes(node.title)) || ed[ed.length - 1];
+    const hit = targets.find((t) => (t.url || '').includes('editor.html') && parseFileId(t.url) === node.fileId);
+    if (!hit) {
+      throw new Error(`打开「${node.title}」失败（${opened.err || 'IPC 未成功'}），点击兜底也没有出现对应窗口。\n`
+        + '请在知犀里手动打开这张图，或重启客户端后重试。不要在这种情况下继续写操作。');
+    }
     return {
       ok: true,
-      title: hit ? hit.title : node.title,
-      fileId: hit ? (hit.url.split('id=')[1] || null) : node.fileId,
+      title: hit.title,
+      fileId: node.fileId,
       path: node.path || null,
       via: 'click',
     };

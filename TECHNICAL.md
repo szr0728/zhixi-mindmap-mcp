@@ -38,6 +38,7 @@ zhiximind-desktop.exe --remote-debugging-port=19222 --remote-allow-origins=* ^
 | `src/driver.js` | 驱动层：页面内辅助脚本注入、节点定位、四类写操作。**知犀升级后要改就改这里** |
 | `src/index.js` | MCP 服务与工具定义 |
 | `test/client.mjs` | 不依赖宿主的命令行联调客户端 |
+| `test/unit.test.mjs` | 纯函数单元测试（`$...$` 转 Delta、fileId 解析），不需要启动客户端：`npm test` |
 
 环境变量：
 
@@ -116,18 +117,18 @@ q.insertEmbed(idx, 'formula', latex, 'user');
 | `zhixi_list_maps` | 云端完整文件夹树，返回每个导图的路径 + fileId；可用 `folder` 只看某个目录 |
 | `zhixi_search_maps` | 按标题关键字搜索，返回路径 + fileId |
 | `zhixi_open_map` | 按 `path` / `fileId` / `title` 打开导图，走主进程 IPC |
-| `zhixi_create_map` | 新建导图（可指定标题与存放文件夹） |
+| `zhixi_create_map` | 新建导图，走 `fs:create-file` 接口（不点界面），默认建完自动打开 |
 | `zhixi_create_folder` | 新建文件夹 |
 | `zhixi_rename_item` | 给导图或文件夹改名 |
-| `zhixi_move_item` | 移动到另一个文件夹 |
-| `zhixi_delete_item` | 移入回收站（必须 `confirm: true`） |
-| `zhixi_read_tree` | 导出节点树，含概要/外框/备注/折叠状态 |
+| `zhixi_move_item` | 移动到另一个文件夹（会拒绝把文件夹移进自己的子目录） |
+| `zhixi_delete_item` | 移入回收站。不带 `confirm` 只返回将被删的内容和子项数量 |
+| `zhixi_read_tree` | 导出节点树，含概要/外框/备注/折叠状态；默认最多 400 个，超出标记 `truncated` |
 | `zhixi_add_node` | 新增单个子节点 |
-| `zhixi_add_nodes` | 批量新增同级子节点（比逐个调用快 3–4 倍） |
-| `zhixi_update_node` | 改节点文字 |
-| `zhixi_delete_node` | 删节点及子树（必须 `confirm: true`，返回被删子树） |
-| `zhixi_move_node` | 把节点移到另一个节点下 |
-| `zhixi_screenshot` | 截图当前画布 |
+| `zhixi_add_nodes` | 批量新增同级子节点（比逐个调用快 3–4 倍），中途失败会报出已成功哪些 |
+| `zhixi_update_node` | 改节点文字，写完会校对，不一致直接报错 |
+| `zhixi_delete_node` | 删节点及子树（必须 `confirm: true`，返回被删子树，删完会核对节点确实消失） |
+| `zhixi_move_node` | 把节点移到另一个节点下（拒绝目标在自己子树里，粘贴失败会重试） |
+| `zhixi_screenshot` | 截图当前画布；超大图只落盘不内联 |
 | `zhixi_verify_synced` | 拉云端文件，确认文字真的落盘 |
 
 写操作建议用 `nodeId`。用文字定位时必须全图唯一，否则报错并列出候选 id——不做模糊匹配，避免删错。
@@ -168,6 +169,35 @@ q.insertEmbed(idx, 'formula', latex, 'user');
 > 这些通道可以从渲染进程用 `window.__runtime.invoke(通道名, 参数)` 直接调，不需要连主进程。`--inspect` 只是当时用来"看有哪些通道、参数是什么"的。
 
 渲染进程**没有** `require` / `process`（contextIsolation 开着），只能通过 preload 暴露的 `window.__runtime`（`invoke / send / sendMessage / on`）。之前失败过的 `m-files-list` 是应用内部的别名，真正注册在主进程里的是 `fs:*` 这一套。
+
+## 健壮性约定（改代码前必须知道）
+
+这个项目所有写操作都是"模拟真人点一下"，一旦点错，代价是用户的数据。所以每步都做了前置校验 + 事后核对：
+
+| 阶段 | 措施 |
+|---|---|
+| 定位 | `nodeId` 必须先确认存在于当前导图；用文字定位时要求全图唯一，多个命中直接报错并列出候选 |
+| 点击前 | `elementFromPoint` 确认该坐标上的确实是目标节点；不在可点区域（视口外/被裁剪）先 `moveNodeToViewCenter`，仍不行就中止 |
+| 点击后 | 检查 `g.zx-node.selected` 里是否真的是目标 id，不是就中止 |
+| 写入后 | 改文字→比对内容；删除→确认节点确实没了且剩余数量对得上；新增→确认出现了新 id；移动→确认落到目标父节点下 |
+| 并发 | 所有写操作进一个 promise 队列串行执行。并发调用会互相抢"当前选中节点"，交错执行等于点错节点 |
+| 失败恢复 | 移动的粘贴失败会重试一次；`wm:r-open-file` 失败会重试三次并在 `getURL` 报错时尝试激活首页 |
+| 进程级 | `unhandledRejection` / `uncaughtException` 兜住只打日志；CDP 通道断开时立刻 reject 所有等待中的调用，不干等超时 |
+
+### 三个踩过的坑
+
+**1. 首页按文字点「思维导图」会点到悬浮提示。** 左侧边栏同一项也有这个文案，`document.querySelectorAll` 会把 `.ant-tooltip-inner` 一起选出来，点它什么都不会发生——但代码看起来"点了"。现在 `zhixi_create_map` 完全不走 UI，直接用 `fs:create-file`：
+
+```js
+invoke('fs:create-file', { data: { type: 'structure', structure: 'none', trackFrom: 'zhixi-mcp' }, pid })
+// → { code: 0, data: { fileId, isFolder: false } }
+```
+
+`type` 必须是字符串 `'structure'`（对应客户端里 `Zc.structure` 这个枚举值），传别的形状会返回 `code: 500`。
+
+**2. `wm:r-open-file` 会因客户端标签页状态异常而报 `Cannot read properties of undefined (reading 'getURL')`。** 它内部靠"当前活跃窗口"找标签页宿主，窗口状态坏了就取不到。实测此时 `wm:r-get-tab-list` 返回空数组、首页 `visibilityState` 恒为 hidden、截图必然超时。**重启客户端即可恢复**（重启后 `via` 变回 `ipc`），代码里已在错误信息里给出这个提示。
+
+**3. 打开导图的兜底路径曾经会"报成功但打开错文件"。** 旧逻辑在 IPC 失败后点击兜底，然后直接取"最后一个编辑器窗口"当结果——如果本来就开着别的图，就会把那张图的 fileId 返回给调用方，后续所有写操作都会落到错误的目标上。现在兜底必须校验 `parseFileId(url) === 目标 fileId`，不匹配就报错，绝不返回一个"看起来成功"的结果。
 
 ## 已知限制
 

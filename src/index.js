@@ -8,7 +8,21 @@ import {
 
 const text = (obj) => ({ content: [{ type: 'text', text: JSON.stringify(obj, null, 2) }] });
 const hint = (a) => (a && (a.mapId || a.mapTitle)) || undefined;
-const fail = (e) => ({ content: [{ type: 'text', text: '错误：' + (e.message || String(e)) }], isError: true });
+const fail = (e) => {
+  // 错误信息过长（含大段堆栈）会把调用方上下文吃掉，截断到一个屏幕以内
+  let msg = (e && e.message) || String(e);
+  if (msg.length > 2000) msg = msg.slice(0, 2000) + '\n…（信息已截断）';
+  return { content: [{ type: 'text', text: '错误：' + msg }], isError: true };
+};
+
+// MCP 服务是常驻进程：一次未捕获异常就整个挂掉，所有会话都断。
+// 这里兜住并打到 stderr，让它至少能继续响应后续请求。
+process.on('unhandledRejection', (e) => {
+  console.error('[zhixi-mcp] 未处理的 Promise 异常:', (e && e.stack) || e);
+});
+process.on('uncaughtException', (e) => {
+  console.error('[zhixi-mcp] 未捕获异常:', (e && e.stack) || e);
+});
 
 const server = new McpServer(
   { name: 'zhixi-mindmap', version: '1.0.0' },
@@ -32,7 +46,15 @@ server.registerTool(
     if (!s.editors.length) hint = '还没有打开的导图，先调用 zhixi_open_map 或在客户端里打开一张';
     else if (s.needSpecify) hint = '同时打开了多张导图，所有节点操作都必须带 mapId（下面的 fileId）指定改哪一张';
     else hint = '已打开导图，可直接读写节点';
-    return text({ connected: true, openEditors: s.editors, needSpecify: s.needSpecify, hint });
+    return text({
+      connected: true,
+      openEditors: s.editors,
+      needSpecify: s.needSpecify,
+      port: s.port,
+      clientExe: s.exe,
+      clientExeExists: s.exeExists,
+      hint,
+    });
   }),
 );
 
@@ -67,10 +89,14 @@ server.registerTool(
   'zhixi_read_tree',
   {
     title: '读取导图节点树',
-    description: '导出当前导图的全部节点（id / 文字 / 层级 / 父节点）。写操作前先用它拿到 nodeId。',
-    inputSchema: { mapId: z.string().optional().describe('导图 id（同时打开多张时必传）'), mapTitle: z.string().optional().describe('导图标题关键字（仅一张匹配时可用）') },
+    description: '导出当前导图的全部节点（id / 文字 / 层级 / 父节点 / 概要 / 外框 / 备注）。写操作前先用它拿到 nodeId。节点很多时只返回前 limit 个并标记 truncated。',
+    inputSchema: {
+      mapId: z.string().optional().describe('导图 id（同时打开多张时必传）'),
+      mapTitle: z.string().optional().describe('导图标题关键字（仅一张匹配时可用）'),
+      limit: z.number().int().positive().max(5000).optional().describe('最多返回多少个节点，默认 400'),
+    },
   },
-  wrap(async (a) => text(await readTree(hint(a)))),
+  wrap(async (a) => text(await readTree(hint(a), { limit: a.limit }))),
 );
 
 server.registerTool(
@@ -167,10 +193,19 @@ server.registerTool(
   },
   wrap(async (a) => {
     const r = await screenshot(hint(a), a.savePath);
+    const kb = Math.round(r.bytes / 1024);
+    // 超大截图内联会把调用方上下文撑爆，这时只给路径
+    const big = r.base64.length > 2500000;
+    if (big && !r.path) {
+      return text({ ok: false, bytes: r.bytes, note: '截图太大（' + kb + 'KB），且没有指定 savePath，无法回传。请传 savePath 保存成文件。' });
+    }
+    if (big) {
+      return text({ ok: true, bytes: r.bytes, path: r.path, note: '截图较大（' + kb + 'KB），已保存到文件，未内联返回。' });
+    }
     return {
       content: [
         { type: 'image', data: r.base64, mimeType: 'image/png' },
-        { type: 'text', text: `已截图${r.path ? '，保存到 ' + r.path : ''}（约 ${Math.round(r.bytes / 1024)} KB）` },
+        { type: 'text', text: `已截图${r.path ? '，保存到 ' + r.path : ''}（约 ${kb} KB）` },
       ],
     };
   }),
@@ -216,10 +251,12 @@ server.registerTool(
   'zhixi_create_map',
   {
     title: '新建导图',
-    description: '新建一张空白思维导图并打开，可指定标题和存放位置。',
+    description: '新建一张空白思维导图并（默认）自动打开，可指定标题和存放位置。走客户端自己的建档接口，不模拟点击。',
     inputSchema: {
-      title: z.string().optional().describe('导图标题，不传则用默认「未命名文件」'),
-      folder: z.string().optional().describe('放到哪个文件夹（完整路径）；不传则放根目录'),
+      title: z.string().optional().describe('导图标题，不传则由客户端给默认名'),
+      folder: z.string().optional().describe('放到哪个文件夹（完整路径，如「考公/申论」）；不传则放根目录'),
+      structure: z.string().optional().describe('导图结构，默认 none（普通思维导图）。一般不用改。'),
+      open: z.boolean().optional().describe('建好后是否自动打开，默认 true'),
     },
   },
   wrap(async (a) => text(await createMap(a))),
@@ -250,6 +287,7 @@ server.registerTool(
       fileId: z.string().optional().describe('要移动的条目的 fileId'),
       title: z.string().optional().describe('要移动的条目标题（全库唯一时可用）'),
       toFolder: z.string().optional().describe('目标文件夹完整路径；不传则移到根目录'),
+      toPath: z.string().optional().describe('同 toFolder，二选一即可'),
     },
   },
   wrap(async (a) => text(await moveItems(a))),
@@ -259,7 +297,7 @@ server.registerTool(
   'zhixi_delete_item',
   {
     title: '删除导图或文件夹',
-    description: '把导图/文件夹移入知犀回收站（可从客户端还原）。破坏性操作：必须传 confirm=true。',
+    description: '把导图/文件夹移入知犀回收站（可从客户端还原）。破坏性操作：先不带 confirm 调用一次会返回将被删的内容和子项数量，确认后再带 confirm=true。',
     inputSchema: {
       path: z.string().optional().describe('完整路径'),
       fileId: z.string().optional().describe('fileId'),

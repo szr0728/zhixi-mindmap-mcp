@@ -23,7 +23,9 @@
     "url": "git+https://github.com/szr0728/zhixi-mindmap-mcp.git"
   },
   "scripts": {
-    "start": "node src/index.js"
+    "start": "node src/index.js",
+    "test": "node --test test/unit.test.mjs",
+    "check": "node --check src/cdp.js && node --check src/driver.js && node --check src/index.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2"

@@ -48,6 +48,7 @@ const main = async () => {
   if (cmd === 'del') console.log(JSON.stringify(await call('zhixi_delete_node', JSON.parse(process.argv[3])), null, 1).slice(0, 800));
   if (cmd === 'move') console.log(JSON.stringify(await call('zhixi_move_node', JSON.parse(process.argv[3])), null, 1).slice(0, 800));
   if (cmd === 'shot') console.log(JSON.stringify(await call('zhixi_screenshot', JSON.parse(process.argv[3] || '{}')), null, 1).slice(0, 400));
+  if (cmd === 't') console.log(JSON.stringify(await call(process.argv[3], JSON.parse(process.argv[4] || '{}')), null, 1).slice(0, 1200));
   if (cmd === 'verify') console.log(JSON.stringify(await call('zhixi_verify_synced', JSON.parse(process.argv[3])), null, 1).slice(0, 600));
   if (cmd === 'open') console.log(JSON.stringify(await call('zhixi_open_map', JSON.parse(process.argv[3])), null, 1).slice(0, 600));
 

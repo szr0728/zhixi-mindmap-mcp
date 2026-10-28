@@ -334,6 +334,177 @@ export async function screenshot(titleHint, outPath) {  return withEditor(titleH
   });
 }
 
+// 首页内的 IPC 调用（返回解析后的结果）
+async function homeInvoke(cdp, channel, arg) {
+  const r = await cdp.eval(`(async () => {
+    try {
+      const res = await window.__runtime.invoke(${JSON.stringify(channel)}, ${JSON.stringify(arg || {})});
+      return { ok: true, res };
+    } catch (e) { return { ok: false, err: String(e && e.message || e).slice(0, 200) }; }
+  })()`);
+  if (!r.ok) throw new Error(`调用 ${channel} 失败：${r.err}`);
+  const res = r.res;
+  if (res && typeof res.code === 'number' && res.code !== 0) {
+    throw new Error(`${channel} 返回错误 code=${res.code}` + (res.message ? `：${res.message}` : ''));
+  }
+  return res && 'data' in res ? res.data : res;
+}
+
+// 把「路径 / 标题 / fileId」解析成树里的节点
+async function resolveItem(cdp, { fileId, path, title, wantFolder = null }) {
+  const all = flattenTree(await fetchTree(cdp));
+  const norm = (s) => (s || '').replace(/\s+/g, '').toLowerCase();
+  const pool = wantFolder === null ? all : all.filter((it) => it.isFolder === wantFolder);
+
+  if (fileId) {
+    const hit = pool.find((it) => it.fileId === fileId);
+    return hit || { fileId, title: title || '', id: null, path: null, isFolder: wantFolder === true };
+  }
+  if (path) {
+    const hit = pool.filter((it) => norm(it.path) === norm(String(path).replace(/^\/+|\/+$/g, '')));
+    if (hit.length === 1) return hit[0];
+    if (hit.length > 1) throw new Error(`路径「${path}」匹配到 ${hit.length} 项，请用 fileId 指定：` + hit.map((h) => `${h.fileId}(${h.title})`).join('、'));
+    const guess = pool.filter((it) => norm(it.path).includes(norm(path))).map((it) => it.path);
+    throw new Error(`没找到路径「${path}」。` + (guess.length ? `相近的有：${guess.slice(0, 6).join('、')}` : ''));
+  }
+  if (title) {
+    const hit = pool.filter((it) => norm(it.title) === norm(title));
+    if (hit.length === 1) return hit[0];
+    if (hit.length > 1) throw new Error(`有 ${hit.length} 项都叫「${title}」，请用 path 或 fileId：` + hit.map((h) => h.path).join('、'));
+    const guess = pool.filter((it) => norm(it.title).includes(norm(title))).map((it) => it.path);
+    throw new Error(`没找到标题为「${title}」的条目。` + (guess.length ? `相近的有：${guess.slice(0, 6).join('、')}` : ''));
+  }
+  throw new Error('需要提供 path / title / fileId 之一');
+}
+
+const ROOT_PID = 0;
+
+export async function createFolder({ title, folder, parentPath }) {
+  if (!title || !String(title).trim()) throw new Error('文件夹名不能为空');
+  const cdp = await attachHome();
+  try {
+    let pid = ROOT_PID;
+    if (folder || parentPath) {
+      const parent = await resolveItem(cdp, { path: parentPath || folder, wantFolder: true });
+      pid = parent.id;
+    }
+    const fileId = await homeInvoke(cdp, 'fs:create-folder', { title: String(title).trim(), pid, password: '' });
+    await sleep(1200);
+    const all = flattenTree(await fetchTree(cdp));
+    const created = all.find((it) => it.fileId === fileId) || null;
+    return { ok: true, title, fileId, path: created ? created.path : null, parentId: pid };
+  } finally { cdp.close(); }
+}
+
+// 新建导图：走界面「新建 → 思维导图」，再用接口改名/归位（接口直接建档需要模板参数，暂时走这条稳的路）
+export async function createMap({ title, folder, parentPath }) {
+  const before = (await listTargets()).filter((t) => (t.url || '').includes('editor.html')).map((t) => (t.url || '').split('id=')[1]);
+  const cdp = await attachHome();
+  let newId = null;
+  try {
+    const clickText = async (text) => {
+      const pos = await cdp.eval(`(() => {
+        const cands = [...document.querySelectorAll('div,span,button,a')].filter((el) => {
+          const t = (el.textContent || '').trim();
+          if (t !== ${JSON.stringify(text)}) return false;
+          const r = el.getBoundingClientRect();
+          return r.width > 8 && r.height > 8 && r.width < 400;
+        });
+        if (!cands.length) return null;
+        cands.sort((a, b) => a.querySelectorAll('*').length - b.querySelectorAll('*').length);
+        const r = cands[0].getBoundingClientRect();
+        return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) };
+      })()`);
+      if (!pos) return false;
+      await click(cdp, pos.x, pos.y);
+      return true;
+    };
+    if (!(await clickText('新建'))) throw new Error('首页没找到「新建」按钮');
+    await sleep(1800);
+    if (!(await clickText('思维导图'))) throw new Error('模板页没找到「思维导图」模板');
+    for (let i = 0; i < 30; i++) {
+      await sleep(700);
+      const now = (await listTargets()).filter((t) => (t.url || '').includes('editor.html')).map((t) => (t.url || '').split('id=')[1]);
+      newId = now.find((id) => id && !before.includes(id));
+      if (newId) break;
+    }
+    if (!newId) throw new Error('点了新建但没等到编辑器窗口出现');
+
+    let pid = null;
+    if (folder || parentPath) {
+      const parent = await resolveItem(cdp, { path: parentPath || folder, wantFolder: true });
+      pid = parent.id;
+    }
+    if (title) await homeInvoke(cdp, 'fs:rename-file', { title: String(title).trim(), fileId: newId, password: '' });
+    if (pid !== null) await homeInvoke(cdp, 'fs:move-files', { dest: pid, fileIds: [newId], password: '' });
+    await sleep(1500);
+    const all = flattenTree(await fetchTree(cdp));
+    const created = all.find((it) => it.fileId === newId);
+    return { ok: true, fileId: newId, title: title || (created && created.title) || '(未命名)', path: created ? created.path : null };
+  } finally { cdp.close(); }
+}
+
+export async function renameItem({ fileId, path, title, newTitle }) {
+  if (!newTitle || !String(newTitle).trim()) throw new Error('新名称不能为空');
+  const cdp = await attachHome();
+  try {
+    const item = await resolveItem(cdp, { fileId, path, title });
+    await homeInvoke(cdp, 'fs:rename-file', { title: String(newTitle).trim(), fileId: item.fileId, password: '' });
+    await sleep(1200);
+    const all = flattenTree(await fetchTree(cdp));
+    const now = all.find((it) => it.fileId === item.fileId);
+    return { ok: true, fileId: item.fileId, oldTitle: item.title, newTitle: String(newTitle).trim(), path: now ? now.path : null };
+  } finally { cdp.close(); }
+}
+
+export async function moveItems({ fileId, path, title, toFolder, toPath }) {
+  const cdp = await attachHome();
+  try {
+    const item = await resolveItem(cdp, { fileId, path, title });
+    let dest = ROOT_PID;
+    let destPath = '';
+    if (toFolder !== undefined || toPath !== undefined) {
+      const parent = await resolveItem(cdp, { path: toPath || toFolder, wantFolder: true });
+      dest = parent.id;
+      destPath = parent.path;
+    }
+    await homeInvoke(cdp, 'fs:move-files', { dest, fileIds: [item.fileId], password: '' });
+    await sleep(1500);
+    const all = flattenTree(await fetchTree(cdp));
+    const now = all.find((it) => it.fileId === item.fileId);
+    return { ok: true, fileId: item.fileId, title: item.title, to: destPath || '(根目录)', path: now ? now.path : null };
+  } finally { cdp.close(); }
+}
+
+export async function deleteItem({ fileId, path, title, confirm }) {
+  if (!confirm) throw new Error('删除是破坏性操作：请先确认目标，然后传 confirm=true。文件会进知犀回收站，可从客户端还原。');
+  const cdp = await attachHome();
+  try {
+    const item = await resolveItem(cdp, { fileId, path, title });
+    await homeInvoke(cdp, 'fs:mark-file-deleted', { fileIds: [item.fileId], password: '' });
+    await sleep(1500);
+    const all = flattenTree(await fetchTree(cdp));
+    const stillThere = all.some((it) => it.fileId === item.fileId);
+    return {
+      ok: !stillThere,
+      deleted: { title: item.title, path: item.path, isFolder: item.isFolder, fileId: item.fileId },
+      note: stillThere ? '接口返回成功但目录里还能看到，可能尚未刷新，请稍后复查' : '已移入回收站',
+    };
+  } finally { cdp.close(); }
+}
+
+export async function searchMaps({ keyword }) {
+  if (!keyword || !String(keyword).trim()) throw new Error('请提供搜索关键字');
+  const cdp = await attachHome();
+  try {
+    const all = flattenTree(await fetchTree(cdp));
+    const norm = (s) => (s || '').replace(/\s+/g, '').toLowerCase();
+    const k = norm(keyword);
+    const hits = all.filter((it) => !it.isFolder && norm(it.title).includes(k));
+    return { keyword, count: hits.length, matches: hits.slice(0, 50).map((h) => ({ path: h.path, title: h.title, fileId: h.fileId })) };
+  } finally { cdp.close(); }
+}
+
 // 首页：列出/打开云文档
 async function attachHome() {
   await ensureClient();

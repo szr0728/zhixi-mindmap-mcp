@@ -3,6 +3,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import {
   status, listMaps, openMap, readTree, addNode, updateNode, deleteNode, moveNode, screenshot, cloudCheck,
+  createFolder, createMap, renameItem, moveItems, deleteItem, searchMaps,
 } from './driver.js';
 
 const text = (obj) => ({ content: [{ type: 'text', text: JSON.stringify(obj, null, 2) }] });
@@ -170,6 +171,87 @@ server.registerTool(
     },
   },
   wrap(async (a) => text(await cloudCheck(a))),
+);
+
+server.registerTool(
+  'zhixi_search_maps',
+  {
+    title: '按标题搜索导图',
+    description: '在全部云文档里按标题关键字搜索，返回完整路径和 fileId。比 zhixi_list_maps 列全量更省。',
+    inputSchema: { keyword: z.string().describe('标题关键字') },
+  },
+  wrap(async (a) => text(await searchMaps(a))),
+);
+
+server.registerTool(
+  'zhixi_create_folder',
+  {
+    title: '新建文件夹',
+    description: '在指定位置新建一个文件夹。不传 folder 就建在根目录。',
+    inputSchema: {
+      title: z.string().describe('文件夹名'),
+      folder: z.string().optional().describe('建在哪个文件夹下（完整路径，如「考公/申论」）；不传则建在根目录'),
+    },
+  },
+  wrap(async (a) => text(await createFolder(a))),
+);
+
+server.registerTool(
+  'zhixi_create_map',
+  {
+    title: '新建导图',
+    description: '新建一张空白思维导图并打开，可指定标题和存放位置。',
+    inputSchema: {
+      title: z.string().optional().describe('导图标题，不传则用默认「未命名文件」'),
+      folder: z.string().optional().describe('放到哪个文件夹（完整路径）；不传则放根目录'),
+    },
+  },
+  wrap(async (a) => text(await createMap(a))),
+);
+
+server.registerTool(
+  'zhixi_rename_item',
+  {
+    title: '重命名导图或文件夹',
+    description: '给导图或文件夹改名。用 path 或 fileId 定位，newTitle 是新名字。',
+    inputSchema: {
+      path: z.string().optional().describe('完整路径'),
+      fileId: z.string().optional().describe('fileId（来自 zhixi_list_maps）'),
+      title: z.string().optional().describe('标题（全库唯一时可用）'),
+      newTitle: z.string().describe('新名字'),
+    },
+  },
+  wrap(async (a) => text(await renameItem(a))),
+);
+
+server.registerTool(
+  'zhixi_move_item',
+  {
+    title: '移动导图或文件夹',
+    description: '把导图/文件夹移动到另一个文件夹下。toFolder 不传则移到根目录。',
+    inputSchema: {
+      path: z.string().optional().describe('要移动的条目的完整路径'),
+      fileId: z.string().optional().describe('要移动的条目的 fileId'),
+      title: z.string().optional().describe('要移动的条目标题（全库唯一时可用）'),
+      toFolder: z.string().optional().describe('目标文件夹完整路径；不传则移到根目录'),
+    },
+  },
+  wrap(async (a) => text(await moveItems(a))),
+);
+
+server.registerTool(
+  'zhixi_delete_item',
+  {
+    title: '删除导图或文件夹',
+    description: '把导图/文件夹移入知犀回收站（可从客户端还原）。破坏性操作：必须传 confirm=true。',
+    inputSchema: {
+      path: z.string().optional().describe('完整路径'),
+      fileId: z.string().optional().describe('fileId'),
+      title: z.string().optional().describe('标题（全库唯一时可用）'),
+      confirm: z.boolean().optional().describe('必须为 true 才会执行'),
+    },
+  },
+  wrap(async (a) => text(await deleteItem(a))),
 );
 
 const transport = new StdioServerTransport();

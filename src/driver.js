@@ -192,9 +192,22 @@ export async function status() {
   const targets = await listTargets();
   const editors = targets.filter((t) => (t.url || '').includes('editor.html'));
   const maps = editors.map(mapInfo);
+
+  // 首页在前台时打开导图才可靠，所以把它作为一个诊断项暴露出来
+  const home = targets.find((t) => (t.url || '').includes('home.html'));
+  let homeVisible = null;
+  if (home) {
+    try {
+      const c = await Cdp.connect(home.webSocketDebuggerUrl);
+      homeVisible = (await c.eval('document.visibilityState')) === 'visible';
+      c.close();
+    } catch { homeVisible = null; }
+  }
+
   return {
     editors: maps,
-    hasHome: targets.some((t) => (t.url || '').includes('home.html')),
+    hasHome: !!home,
+    homeVisible,
     needSpecify: maps.length > 1,
     port: getPort(),
     exe: getExePath(),
@@ -1038,8 +1051,11 @@ async function openByFileId(cdp, node) {
 
   let lastErr = null;
   let activatedHome = false;
+  let homeHidden = false;
   for (let attempt = 0; attempt < 3; attempt++) {
     if (attempt) await sleep(1400); // 刚建的文件可能还没进索引
+    if (attempt === 0) homeHidden = (await cdp.eval('document.visibilityState').catch(() => '')) === 'hidden';
+
     let r;
     try { r = await invoke(); } catch (e) { lastErr = e.message; continue; }
 
@@ -1065,7 +1081,7 @@ async function openByFileId(cdp, node) {
     if (hit) return hit;
     lastErr = '调用成功但编辑器窗口迟迟没出现';
   }
-  return { target: null, err: lastErr || '未知错误' };
+  return { target: null, err: lastErr || '未知错误', homeHidden };
 }
 
 const findTitleInHome = `(() => {
@@ -1134,6 +1150,19 @@ export async function openMap({ title, path, fileId } = {}) {
 
     if (!node.fileId) throw new Error('解析不到该导图的 fileId');
 
+    // 已经打开着就直接用，不要再调打开接口（省一次失败重试，也不会切走用户当前的标签页）
+    const opened0 = (await listTargets()).find((t) => (t.url || '').includes('editor.html') && parseFileId(t.url) === node.fileId);
+    if (opened0) {
+      return {
+        ok: true,
+        alreadyOpen: true,
+        title: opened0.title,
+        fileId: node.fileId,
+        path: node.path || null,
+        note: '这张图已经是打开状态，可以直接对它读写节点',
+      };
+    }
+
     const opened = await openByFileId(cdp, node);
     if (opened.target) {
       const t = opened.target.title || '';
@@ -1150,14 +1179,23 @@ export async function openMap({ title, path, fileId } = {}) {
     // 结果是打开失败却报成功，还把别人的图当成了目标，非常危险。
     const clicked = await openByClick(node.title);
     if (!clicked) {
-      throw new Error(`按 fileId 打开失败（${opened.err || '未知'}），首页点击也找不到「${node.title}」。\n`
-        + '可以稍等几秒重试；如果反复失败，重启知犀客户端再试（标签页状态可能异常）。');
+      const why = opened.homeHidden
+        ? '首页标签页不在前台（当前显示的是别的导图），知犀的打开接口在这种情况下不可用。'
+        : `接口报错：${opened.err || '未知'}`;
+      throw new Error(
+        `打开「${node.title}」失败。${why}\n`
+        + '处理办法（任选其一）：\n'
+        + '1) 让用户在知犀里点一下标题栏左侧的「首页」标签，然后重试；\n'
+        + '2) 在客户端里手动双击这张图打开，之后直接用节点工具，不必再 open。',
+      );
     }
     const targets = await listTargets();
     const hit = targets.find((t) => (t.url || '').includes('editor.html') && parseFileId(t.url) === node.fileId);
     if (!hit) {
-      throw new Error(`打开「${node.title}」失败（${opened.err || 'IPC 未成功'}），点击兜底也没有出现对应窗口。\n`
-        + '请在知犀里手动打开这张图，或重启客户端后重试。不要在这种情况下继续写操作。');
+      throw new Error(`打开「${node.title}」失败，点击兜底也没有出现对应窗口。\n`
+        + (opened.homeHidden ? '原因大概率是首页标签页不在前台（知犀的打开接口在该状态下不可用）。\n' : '')
+        + '请让用户点一下标题栏左侧的「首页」标签，或在客户端里手动双击这张图，然后直接用节点工具。\n'
+        + '这种情况下不要继续对节点做写操作。');
     }
     return {
       ok: true,

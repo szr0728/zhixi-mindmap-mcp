@@ -195,7 +195,16 @@ invoke('fs:create-file', { data: { type: 'structure', structure: 'none', trackFr
 
 `type` 必须是字符串 `'structure'`（对应客户端里 `Zc.structure` 这个枚举值），传别的形状会返回 `code: 500`。
 
-**2. `wm:r-open-file` 会因客户端标签页状态异常而报 `Cannot read properties of undefined (reading 'getURL')`。** 它内部靠"当前活跃窗口"找标签页宿主，窗口状态坏了就取不到。实测此时 `wm:r-get-tab-list` 返回空数组、首页 `visibilityState` 恒为 hidden、截图必然超时。**重启客户端即可恢复**（重启后 `via` 变回 `ipc`），代码里已在错误信息里给出这个提示。
+**2. `wm:r-open-file` 只在首页标签页处于前台时可用。** 它内部靠"当前活跃窗口"找标签页宿主；当界面上显示的是某张导图（首页被切到后台）时，会报 `Cannot read properties of undefined (reading 'getURL')`。
+
+试过但**无效**的绕过方式：`Target.activateTarget(home)`、`Page.bringToFront`、在 titlebar 里点首页标签、`wm:r-tab-click` / `wm:r-tab-show` 传 `data-tab` 的值。这个 webview 的可见性由宿主窗口控制，页面侧改不动。
+
+有效做法：
+- 目标图**已经打开**时直接复用，根本不调打开接口（`alreadyOpen: true`）；
+- 检查失败原因，明确告诉调用方"去点一下首页标签"，而不是含糊地说"重试"；
+- `zhixi_status` 暴露 `homeVisible`，可以提前判断。
+
+同一个根因还会导致：首页 `visibilityState` 恒为 hidden、对首页 `Page.captureScreenshot` 必然超时。截首页请先让用户切回首页。
 
 **3. 打开导图的兜底路径曾经会"报成功但打开错文件"。** 旧逻辑在 IPC 失败后点击兜底，然后直接取"最后一个编辑器窗口"当结果——如果本来就开着别的图，就会把那张图的 fileId 返回给调用方，后续所有写操作都会落到错误的目标上。现在兜底必须校验 `parseFileId(url) === 目标 fileId`，不匹配就报错，绝不返回一个"看起来成功"的结果。
 

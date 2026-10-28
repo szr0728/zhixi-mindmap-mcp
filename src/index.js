@@ -46,14 +46,21 @@ server.registerTool(
     if (!s.editors.length) hint = '还没有打开的导图，先调用 zhixi_open_map 或在客户端里打开一张';
     else if (s.needSpecify) hint = '同时打开了多张导图，所有节点操作都必须带 mapId（下面的 fileId）指定改哪一张';
     else hint = '已打开导图，可直接读写节点';
+
+    // 首页不在前台时知犀的打开接口会失败，提前说清楚，省一轮试错
+    const warnings = [];
+    if (s.homeVisible === false) warnings.push('知犀当前显示的不是首页标签页，此时 zhixi_open_map 很可能失败；需要用户点一下标题栏左侧的首页图标。');
+
     return text({
       connected: true,
       openEditors: s.editors,
       needSpecify: s.needSpecify,
+      homeVisible: s.homeVisible,
       port: s.port,
       clientExe: s.exe,
       clientExeExists: s.exeExists,
       hint,
+      ...(warnings.length ? { warnings } : {}),
     });
   }),
 );
